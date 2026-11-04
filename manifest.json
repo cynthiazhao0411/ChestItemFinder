@@ -1,0 +1,9 @@
+{
+  "Name": "ChestItemFinder",
+  "Author": "Cynthia Zhao",
+  "Version": "1.0.0",
+  "Description": "Find which chest contains your item",
+  "UniqueID": "CynthiaZhao.ChestItemFinder",
+  "EntryDll": "ChestItemFinder.dll",
+  "MinimumApiVersion": "3.0.0"
+}
