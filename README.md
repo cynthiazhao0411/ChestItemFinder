@@ -10,6 +10,7 @@ A Stardew Valley mod (C#, SMAPI) that finds which chests contain a given item.
 - Highlights clear automatically after opening a chest
 
 ## Usage
+Download: https://www.nexusmods.com/stardewvalley/mods/55016
 In the SMAPI console:
 `find_item Ancient Fruit`
 
