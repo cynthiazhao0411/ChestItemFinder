@@ -1,9 +1,16 @@
 {
   "Name": "ChestItemFinder",
   "Author": "Cynthia Zhao",
-  "Version": "1.0.0",
+  "Version": "1.1.0",
   "Description": "Find which chest contains your item",
   "UniqueID": "CynthiaZhao.ChestItemFinder",
   "EntryDll": "ChestItemFinder.dll",
-  "MinimumApiVersion": "3.0.0"
+  "MinimumApiVersion": "4.0.0",
+  "UpdateKeys": [ "Nexus:55016" ],
+  "Dependencies": [
+    {
+      "UniqueID": "spacechase0.GenericModConfigMenu",
+      "IsRequired": false
+    }
+  ]
 }
