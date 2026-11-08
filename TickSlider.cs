@@ -30,6 +30,19 @@ namespace ChestItemFinder
         private static readonly Rectangle TrackSource = new(403, 383, 6, 6);
         private static readonly Rectangle KnobSource = new(420, 441, 10, 6);
 
+        /// <summary>Color of the label of the selected stop: the same dark red as its tick mark, drawn larger and bold so it stands out from the other labels.</summary>
+        private static readonly Color SelectedLabelColor = Color.DarkRed;
+
+        /// <summary>Size of the selected label compared to the other labels (1 = same size).</summary>
+        private const float SelectedLabelScale = 1.25f;
+
+        /// <summary>
+        /// How much heavier the selected label is than a normal one, in pixels: the pixel font has no bold version, so the label is drawn
+        /// several times, each copy moved by up to this many pixels to the right / down. Bigger = bolder.
+        /// </summary>
+        private const int SelectedLabelBoldX = 2;
+        private const int SelectedLabelBoldY = 1;
+
         private readonly Func<int> readConfig;
         private readonly Action<int> writeConfig;
         private readonly int min;
@@ -99,7 +112,26 @@ namespace ChestItemFinder
                 // label under the tick
                 string label = $"{stopValue}%";
                 Vector2 size = Game1.smallFont.MeasureString(label);
-                Utility.drawTextWithShadow(b, label, Game1.smallFont, new Vector2(centerX - size.X / 2f, tickTop + 18), tickColor);
+                if (selected)
+                {
+                    // a little larger than the other labels, and bold: the label is drawn several times, each copy moved a pixel or two (see
+                    // SelectedLabelBoldX / Y). No text shadow. It grows around the same center as the other labels.
+                    var labelPos = new Vector2(
+                        centerX - (size.X * SelectedLabelScale + SelectedLabelBoldX) / 2f,
+                        tickTop + 18 - size.Y * (SelectedLabelScale - 1f) / 2f);
+
+                    for (int dy = 0; dy <= SelectedLabelBoldY; dy++)
+                    {
+                        for (int dx = 0; dx <= SelectedLabelBoldX; dx++)
+                        {
+                            b.DrawString(Game1.smallFont, label, labelPos + new Vector2(dx, dy), SelectedLabelColor, 0f, Vector2.Zero, SelectedLabelScale, SpriteEffects.None, 0f);
+                        }
+                    }
+                }
+                else
+                {
+                    Utility.drawTextWithShadow(b, label, Game1.smallFont, new Vector2(centerX - size.X / 2f, tickTop + 18), tickColor);
+                }
             }
 
             // knob (drawn last, on top of the notches)

@@ -22,9 +22,9 @@ namespace ChestItemFinder
 
         /// <summary>
         /// Real-world seconds before chest highlights disappear on their own (0 = never).
-        /// One of: 0, 30, 60, 120, 300, 600, 900, 1200 (never, 30 s, 1, 2, 5, 10, 15, 20 min).
+        /// One of: 0, 30, 60, 120, 180, 300 (never, 30 s, 1, 2, 3, 5 min).
         /// Uses the real clock, so time-speed mods do not affect it.
         /// </summary>
-        public int HighlightTimeoutSeconds { get; set; } = 600;
+        public int HighlightTimeoutSeconds { get; set; } = 180;
     }
 }

@@ -27,6 +27,13 @@ namespace ChestItemFinder
         private Vector2 lastGrabTile = new Vector2(-1, -1);
         private ModConfig Config = new();
 
+        // --- search history (saved per save file, newest first) ---
+        private const string SearchHistorySaveKey = "search-history";
+        private readonly List<string> searchHistory = new();
+
+        // --- search suggestions (auto-complete): the word list is built the first time the search box opens ---
+        private SuggestionIndex? suggestionIndex;
+
         // --- hover interaction on the result panel ---
         // While the mouse is over the panel its countdown is frozen. After the mouse leaves, the countdown
         // resumes, but never from less than this, so a panel that was almost gone does not vanish instantly.
@@ -122,11 +129,11 @@ namespace ChestItemFinder
         }
 
         // highlight timeout choices offered in the config menu (seconds, and the text shown for each)
-        private static readonly int[] TimeoutSecondsChoices = { 0, 30, 60, 120, 300, 600, 900, 1200 };
+        private static readonly int[] TimeoutSecondsChoices = { 0, 30, 60, 120, 180, 300 };
 
         private static readonly string[] TimeoutLabels =
         {
-            "Never", "30 seconds", "1 minute", "2 minutes", "5 minutes", "10 minutes", "15 minutes", "20 minutes"
+            "Never", "30 seconds", "1 minute", "2 minutes", "3 minutes", "5 minutes"
         };
 
         /// <summary>Returns the closest allowed timeout in seconds (fixes hand-edited config.json values).</summary>
@@ -147,6 +154,9 @@ namespace ChestItemFinder
 
             helper.Events.GameLoop.GameLaunched += OnGameLaunched;
             helper.Events.GameLoop.ReturnedToTitle += (_, _) => ClearHighlights();
+            helper.Events.GameLoop.SaveLoaded += OnSaveLoaded;
+            helper.Events.GameLoop.Saving += (_, _) => SaveSearchHistory();
+            helper.Events.GameLoop.ReturnedToTitle += (_, _) => searchHistory.Clear();   // history belongs to a save file: do not leak it into the next one
             helper.Events.Input.ButtonPressed += OnButtonPressed;
             helper.Events.Display.RenderedWorld += OnRenderedWorld;
             helper.Events.Display.RenderedHud += OnRenderedHud;
@@ -176,17 +186,25 @@ namespace ChestItemFinder
                 tooltip: () => "Press this key (or key combination) in-game to open the chest search box. Default: LeftShift + T."
             );
 
-            // the game's normal slider; each step is one of the fixed timeouts and shows its own text (Never, 30 seconds, 1 minute, ...)
-            api.AddNumberOption(
+            // a slider that follows the mouse smoothly (the knob is not forced onto a step while dragging); the nearest of the fixed timeouts
+            // is shown next to it (Never, 30 seconds, 1 minute, ...) and is what gets saved
+            var timeoutSlider = new SmoothSlider(
+                readConfig: () => Array.IndexOf(TimeoutSecondsChoices, NormalizeTimeoutSeconds(Config.HighlightTimeoutSeconds)),
+                writeConfig: step => Config.HighlightTimeoutSeconds = TimeoutSecondsChoices[Math.Clamp(step, 0, TimeoutSecondsChoices.Length - 1)],
+                stopCount: TimeoutSecondsChoices.Length,
+                formatStop: step => TimeoutLabels[Math.Clamp(step, 0, TimeoutLabels.Length - 1)]
+            );
+
+            api.AddComplexOption(
                 mod: ModManifest,
-                getValue: () => Array.IndexOf(TimeoutSecondsChoices, NormalizeTimeoutSeconds(Config.HighlightTimeoutSeconds)),
-                setValue: step => Config.HighlightTimeoutSeconds = TimeoutSecondsChoices[Math.Clamp(step, 0, TimeoutSecondsChoices.Length - 1)],
                 name: () => "Highlight timeout",
-                tooltip: () => "Real-world time before chest highlights disappear by themselves. Never = they stay until you open a found chest. Not affected by in-game time speed.",
-                min: 0,
-                max: TimeoutSecondsChoices.Length - 1,
-                interval: 1,
-                formatValue: step => TimeoutLabels[Math.Clamp(step, 0, TimeoutLabels.Length - 1)]
+                draw: timeoutSlider.Draw,
+                tooltip: () => "Real-world time before chest highlights disappear by themselves. Never = they stay until you open a found chest. Not affected by in-game time speed. Default: 3 minutes.",
+                beforeMenuOpened: timeoutSlider.Reload,
+                beforeSave: timeoutSlider.Commit,
+                afterReset: timeoutSlider.Reload,
+                beforeMenuClosed: timeoutSlider.CancelDrag,
+                height: () => SmoothSlider.RowHeight
             );
 
             // slider with visible tick marks and labels at the six fixed stops (0, 20, 40, 60, 80, 100)
@@ -202,7 +220,7 @@ namespace ChestItemFinder
                 mod: ModManifest,
                 name: () => "Highlight opacity",
                 draw: opacitySlider.Draw,
-                tooltip: () => "How strong the flashing highlight on chests is. 0% = no highlight is drawn, 100% = fully opaque at the brightest point.",
+                tooltip: () => "How strong the flashing highlight on chests is. 0% = no highlight is drawn, 100% = fully opaque at the brightest point. Default: 60%.",
                 beforeMenuOpened: opacitySlider.Reload,
                 beforeSave: opacitySlider.Commit,
                 afterReset: opacitySlider.Reload,
@@ -215,9 +233,52 @@ namespace ChestItemFinder
                 getValue: () => Config.HighlightColor,
                 setValue: value => Config.HighlightColor = NormalizeColorName(value),
                 name: () => "Highlight color",
-                tooltip: () => "Color of the flashing highlight on chests. Works together with the opacity setting.",
+                tooltip: () => "Color of the flashing highlight on chests. Works together with the opacity setting. Default: Yellow.",
                 allowedValues: HighlightColorNames
             );
+        }
+
+        // Loads this save file's search history (at most 5 words, no duplicates).
+        private void OnSaveLoaded(object? sender, SaveLoadedEventArgs e)
+        {
+            searchHistory.Clear();
+
+            try
+            {
+                SearchHistoryData? data = Helper.Data.ReadSaveData<SearchHistoryData>(SearchHistorySaveKey);
+                if (data?.Items == null)
+                    return;
+
+                foreach (string raw in data.Items)
+                {
+                    string item = (raw ?? "").Trim();
+                    if (item.Length == 0 || searchHistory.Count >= SearchMenu.MaxHistory)
+                        continue;
+                    if (searchHistory.Any(h => string.Equals(h, item, StringComparison.OrdinalIgnoreCase)))
+                        continue;
+                    searchHistory.Add(item);
+                }
+            }
+            catch (Exception ex)
+            {
+                Monitor.Log($"Could not read the search history: {ex.Message}", LogLevel.Warn);
+            }
+        }
+
+        // Writes the search history into the current save's mod data. Called after every change and again when the game saves.
+        private void SaveSearchHistory()
+        {
+            if (!Context.IsWorldReady)
+                return;
+
+            try
+            {
+                Helper.Data.WriteSaveData(SearchHistorySaveKey, new SearchHistoryData { Items = new List<string>(searchHistory) });
+            }
+            catch (Exception ex)
+            {
+                Monitor.Log($"Could not save the search history: {ex.Message}", LogLevel.Warn);
+            }
         }
 
         // Letter and number keys type a character into the text box when they open it.
@@ -244,7 +305,47 @@ namespace ChestItemFinder
 
             Helper.Input.SuppressActiveKeybinds(Config.SearchKey);
             // e.Button is the key that completed the combo (e.g. T in LeftShift + T, or LeftShift if T was already held)
-            Game1.activeClickableMenu = new SearchMenu(ScanChests, GetLeakedChar(e.Button));
+            Game1.activeClickableMenu = new SearchMenu(ScanChests, searchHistory, SaveSearchHistory, GetLeakedChar(e.Button), CreateSuggestionProvider());
+        }
+
+        // Prepares the auto-complete for one opening of the search box. If anything goes wrong this returns null and the
+        // search box simply works without a drop-down, so a problem here can never break searching itself.
+        private Func<string, IReadOnlyList<Suggestion>>? CreateSuggestionProvider()
+        {
+            try
+            {
+                suggestionIndex ??= new SuggestionIndex();
+                suggestionIndex.EnsureBuilt();                          // game item names (built once, rebuilt if the language or item data changed)
+                suggestionIndex.SetOwnedNames(GetChestItemNames());     // what is in the chests right now (ranked first)
+
+                SuggestionIndex index = suggestionIndex;
+                return query => index.Search(query, SearchMenu.MaxSuggestions);
+            }
+            catch (Exception ex)
+            {
+                Monitor.Log($"Search suggestions are unavailable: {ex.Message}", LogLevel.Warn);
+                Monitor.Log(ex.ToString(), LogLevel.Trace);
+                return null;
+            }
+        }
+
+        // The display name of every item in every chest (same chests as ScanChests looks at).
+        private IEnumerable<string> GetChestItemNames()
+        {
+            foreach (var (location, _) in GetAllLocations())
+            {
+                foreach (var obj in location.objects.Pairs)
+                {
+                    if (obj.Value is not Chest chest)
+                        continue;
+
+                    foreach (Item? item in chest.Items)
+                    {
+                        if (item != null)
+                            yield return item.DisplayName;
+                    }
+                }
+            }
         }
 
         // Opening ANY chest that contains the target clears ALL highlights.
@@ -564,6 +665,30 @@ namespace ChestItemFinder
                 || variants.Skip(1).Any(v => NameContains(i, v, v));
         }
 
+        /// <summary>
+        /// True if the search treats this text as a category word (rules P1 and P2 of <see cref="BuildMatcher"/>, same tables).
+        /// Used only to label the auto-complete suggestions; it does not take part in searching.
+        /// </summary>
+        internal static bool IsCategoryWord(string rawText)
+        {
+            string query = (rawText ?? "").Trim();
+            if (query.Length == 0 || int.TryParse(query, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out _))
+                return false;
+
+            if (SingleWordCategories.ContainsKey(query.ToLowerInvariant()))
+                return true;
+
+            string normQuery = Norm(query);
+            string[] tokens = query.ToLowerInvariant().Split(QuerySeparators, StringSplitOptions.RemoveEmptyEntries);
+            foreach (var (_, words) in MultiWordCategories)
+            {
+                if ((tokens.Length > 0 && tokens.All(words.Contains)) || words.Contains(normQuery))
+                    return true;
+            }
+
+            return false;
+        }
+
         // Categories whose items can carry a quality star (silver / gold / iridium). Items outside these
         // categories (Wood, Stone, ...) have no star, so the star filter is ignored for them.
         private static readonly HashSet<int> QualityCategories = new()
@@ -588,7 +713,7 @@ namespace ChestItemFinder
             return item.Quality > 0 || QualityCategories.Contains(item.Category);
         }
 
-        /// <param name="quality">Star filter: -1 = any, 1 = silver, 2 = gold, 4 = iridium.</param>
+        /// <param name="quality">Star filter: -1 = any (no filtering), 0 = no star, 1 = silver, 2 = gold, 4 = iridium.</param>
         private SearchOutcome ScanChests(string rawQuery, int quality = AnyQuality)
         {
             string itemName = rawQuery.Trim();
@@ -620,7 +745,8 @@ namespace ChestItemFinder
 
             Func<Item, bool> matches = BuildMatcher(allItems, itemName);
 
-            // star filter: items without stars (Wood, Stone, ...) ignore it; star-capable items must match the chosen quality
+            // star filter: items that can never have stars (Wood, Stone, cooked dishes, ...) ignore it, for every choice including "no star";
+            // star-capable items must match the chosen quality exactly (0 = normal quality, i.e. no star)
             if (quality != AnyQuality)
             {
                 Func<Item, bool> nameMatches = matches;
