@@ -1,6 +1,7 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Linq;
 using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
 using Microsoft.Xna.Framework.Input;
@@ -19,10 +20,67 @@ namespace ChestItemFinder
         NoMatchingQuality
     }
 
+    /// <summary>
+    /// The answer of a search: what happened, and which search words really found something in a chest (with the chosen star).
+    /// Only those words are remembered in the search history; a word that found nothing, or could not be searched, never is.
+    /// </summary>
+    public sealed class SearchReport
+    {
+        public SearchOutcome Outcome { get; }
+
+        /// <summary>The words (separate search terms) that found at least one item. Empty when nothing was found.</summary>
+        public IReadOnlyList<string> FoundTerms { get; }
+
+        public SearchReport(SearchOutcome outcome, IReadOnlyList<string>? foundTerms = null)
+        {
+            Outcome = outcome;
+            FoundTerms = foundTerms ?? Array.Empty<string>();
+        }
+    }
+
     public class SearchMenu : IClickableMenu
     {
         /// <summary>Minimum characters required for a text search (pure-number IDs are exempt).</summary>
         private const int MinQueryLength = 3;
+
+        /// <summary>
+        /// The red hints for a query that is only spaces / tabs, for a query that is too short, for a query made only of symbols,
+        /// for a query with stray round brackets, and for a query with characters that cannot belong to an item name
+        /// (all five are shown in the hint row under the text box). A query with several words ("fruit, fish") is judged word by word, but a bad
+        /// word never refuses the search while at least one other word can be searched: the bad words are shown as "(Invalid: ...)" in the title
+        /// of the result panel instead (see ModEntry.ScanChests). Only when NO word can be searched, the query gets one of two hints instead:
+        /// invalid symbols, or too short.
+        /// </summary>
+        private const string TooShortHintText = "Please enter at least 3 characters";
+        private const string BlankHintText = "Spaces or tabs are not allowed as a search.";
+        private const string SymbolsOnlyHintText = "Please don't enter only symbols";
+        private const string InvalidBracketsHintText = "Invalid brackets. Use (category) for categories.";
+        private const string InvalidCharactersHintText = "Invalid characters. Please use letters and numbers.";
+
+        /// <summary>The two hints of a query with SEVERAL words ("fruit, &amp;&amp;&amp;", "fruit, fi") when none of its words can be searched. As long as at least one word can be searched, these are not shown: the bad words only appear as "(Invalid: ...)" in the result title.</summary>
+        private const string MultiInvalidSymbolsHintText = "One of the search terms contains invalid symbols.";
+        private const string MultiTooShortHintText = "One of the search terms is too short.";
+
+        /// <summary>
+        /// Punctuation a search may contain besides letters, digits, spaces and (in any script) letters with accents:
+        /// straight and curly apostrophe ("Farmer's Lunch"), hyphen (negative category ids like "-26", and "Auto-Grabber"),
+        /// underscore (the search ignores it like the hyphen), period ("L. Goat Milk") and comma (it separates several search words).
+        /// The separators of several search words (, ; / \ &amp; + and their full-width forms, see ModEntry.QueryCommas) are cut out of the text
+        /// before this check, so they never reach it; a query made of nothing but such separators counts as "only symbols".
+        /// Everything else (* $ @ # % ^ = ~ ... and emoji) is refused. Round brackets are not in this list on purpose:
+        /// the one legal use, the " (category)" label, is cut off before this check, and any other bracket is refused earlier by its own hint.
+        /// To allow one more symbol, add it to this string.
+        /// </summary>
+        private const string AllowedPunctuation = "'\u2019-_.,";
+
+        /// <summary>
+        /// Round brackets, half-width and full-width. After the one legal " (category)" label has been cut off (ModEntry.StripCategorySuffix),
+        /// none of these may be left in the query.
+        /// </summary>
+        private static readonly char[] BracketChars = { '(', ')', '\uFF08', '\uFF09' };
+
+        /// <summary>The game's own cue played when a search is refused by one of the checks above (only spaces / tabs, only symbols, too short, invalid brackets, or invalid characters).</summary>
+        private const string RefusedSound = "cancel";
 
         /// <summary>Menu height. Taller than before to make room for the (possibly two-line) hint row, plus some air below the key hint line.</summary>
         private const int MenuHeight = 330;
@@ -33,6 +91,13 @@ namespace ChestItemFinder
         /// </summary>
         private static readonly int[] QualityValues = { -1, 1, 2, 4, 0 };
         private static readonly string[] QualityLabels = { "Any quality", "Silver star", "Gold star", "Iridium star", "No quality" };
+
+        /// <summary>
+        /// The star filter the player picked last, remembered for the rest of this game session so the next search box opens with it
+        /// (a position in <see cref="QualityValues"/>, not a quality value: 0 = "Any quality"). Static and in memory only: it is not saved
+        /// to config.json, so after restarting the game the filter is back to "Any quality".
+        /// </summary>
+        private static int lastQualityIndex = 0;
 
         // quality star sprites in Game1.mouseCursors (the same ones the game draws on item icons)
         private static readonly Rectangle SilverStarSource = new(338, 400, 8, 8);
@@ -59,9 +124,9 @@ namespace ChestItemFinder
         //   header row:  "Recent searches" on the left, the red [Clear History] button on the right
         //   word rows:   the history words
         //   divider, then the "= Enter to search / = Esc to cancel" line
-        private const int HistoryHeaderY = 196;
+        private const int HistoryHeaderY = 204;   // was 196: moved down 8px to leave room for the tip line above the history block
         private const int HistoryHeaderHeight = 40;
-        private const int HistoryRowsTop = 248;
+        private const int HistoryRowsTop = 256;   // was 248 (same 8px; the menu and the Enter / Esc line follow automatically)
         private const int HistoryRowHeight = 40;
         private const int HistoryFooterGap = 8;
 
@@ -82,8 +147,14 @@ namespace ChestItemFinder
 
         // --- search suggestions (auto-complete drop-down) ---
 
-        /// <summary>How many suggestions the drop-down shows at most.</summary>
-        public const int MaxSuggestions = 6;
+        /// <summary>
+        /// How many suggestions the search asks for at most (the whole list the drop-down can scroll through).
+        /// ModEntry passes this number to the suggestion index as its limit, so raising it here is all it takes to allow longer lists.
+        /// </summary>
+        public const int MaxSuggestions = 100;
+
+        /// <summary>How many suggestion rows the drop-down shows at once. A longer list gets a scrollbar; a list this short or shorter looks as before.</summary>
+        public const int MaxVisibleSuggestions = 6;
 
         /// <summary>Minimum row height of the drop-down (it grows if the font is taller).</summary>
         private const int MinSuggestionRowHeight = 36;
@@ -94,6 +165,24 @@ namespace ChestItemFinder
 
         /// <summary>Gap between the bottom of the text box and the top of the drop-down.</summary>
         private const int SuggestionGap = 4;
+
+        // --- scrollbar of the drop-down (only shown when there are more suggestions than rows) ---
+        // Same sprites the game's own menus use: a track drawn with the slider-track box and a 6x10 pixel knob, zoom 4.
+
+        /// <summary>Width of the scrollbar track (6px sprite * zoom 4).</summary>
+        private const int ScrollbarWidth = 24;
+
+        /// <summary>Space between the rows and the scrollbar.</summary>
+        private const int ScrollbarGap = 6;
+
+        /// <summary>Height of the knob (10px sprite * zoom 4); smaller only if the track itself is shorter.</summary>
+        private const int ScrollbarThumbHeight = 40;
+
+        /// <summary>Extra clickable room left and right of the track.</summary>
+        private const int ScrollbarHitPad = 3;
+
+        private static readonly Rectangle ScrollbarTrackSource = new(403, 383, 6, 6);
+        private static readonly Rectangle ScrollbarThumbSource = new(435, 463, 6, 10);
 
         // --- magnifier button (inside the search box, at its right end, left of the star button) ---
 
@@ -127,34 +216,63 @@ namespace ChestItemFinder
             "........h"
         };
 
+        // --- clear button (inside the search box, directly left of the magnifier): a small red x that empties the text ---
+
+        /// <summary>Screen pixels per cross pixel (the same 3 as the magnifier and the red x of the history words).</summary>
+        private const int ClearTextPixel = 3;
+
+        /// <summary>The cross is drawn on a 7 x 7 grid, so it is 21 x 21 screen pixels: a little smaller than the magnifier (27 x 27).</summary>
+        private const int ClearTextGrid = 7;
+        private const int ClearTextSize = ClearTextGrid * ClearTextPixel;
+
+        /// <summary>Extra clickable / hover room around the cross on every side (the whole area lies inside the text box).</summary>
+        private const int ClearTextHitPad = 4;
+
+        /// <summary>Gap between the clickable area of the cross and the clickable area of the magnifier.</summary>
+        private const int ClearTextGap = 4;
+
+        /// <summary>How far the soft shadow of the cross is moved (screen pixels), the same as the magnifier's.</summary>
+        private const int ClearTextShadowOffset = 2;
+
         private readonly TextBox textBox;
-        private readonly Func<string, int, SearchOutcome> onConfirm;
+        private readonly Func<string, int, SearchReport> onConfirm;
         private readonly string? leakedChar;
         private readonly Rectangle starButton;
-        private readonly List<string> history;
+        private readonly List<SearchHistoryEntry> history;
         private readonly Action onHistoryChanged;
         private readonly int extraHeight;
         private int ticks = 0;
 
-        private bool showTooShortHint = false;
+        private bool showTooShortHint = false;   // also used for the "only spaces / tabs", "only symbols", "invalid brackets" and "invalid characters" warnings: this flag means "show the red validation hint"
+        private string validationHintText = TooShortHintText;   // which text that red hint shows
         private bool showNoQualityHint = false;
         private int qualityIndex = 0;
         private string lastText = "";
 
-        // auto-complete state: the current list, the row picked with the arrow keys (-1 = none), and a text for which
-        // the list stays closed (a history word that was just filled in, or a search that was refused)
+        // auto-complete state: the current list, the row picked with the arrow keys (-1 = none; an index into the WHOLE list, not into the
+        // visible rows), and a text for which the list stays closed (a history word that was just filled in, or a search that was refused)
         private readonly Func<string, IReadOnlyList<Suggestion>>? getSuggestions;
         private IReadOnlyList<Suggestion> suggestions = Array.Empty<Suggestion>();
         private int activeSuggestion = -1;
         private string? suppressedText;
+
+        // Multi-term search: the drop-down completes only the word being typed (the one after the last comma, see RefreshSuggestions).
+        // This is the text that stays in front of it when a suggestion is picked: "fruit, " for "fruit, fi". Empty = the whole text is completed.
+        private string suggestionPrefix = "";
+        private static readonly char[] SpaceChars = { ' ', '\t' };
         private bool magnifierPressStarted;   // the left button went down on the magnifier and is (possibly) still held
 
-        /// <param name="onConfirm">Called with the search text and the star filter (-1 = any, 0 = no star) when the player presses Enter. Return <see cref="SearchOutcome.NoMatchingQuality"/> to keep the menu open.</param>
-        /// <param name="history">The recent searches, newest first. The menu edits this list directly.</param>
+        // scrolling of the drop-down: index of the first visible suggestion, and the state of a scrollbar drag
+        private int suggestionScroll = 0;
+        private bool draggingScrollbar = false;
+        private int scrollbarGrabOffset = 0;   // where inside the knob the mouse grabbed it (pixels from the knob's top), so the knob does not jump
+
+        /// <param name="onConfirm">Called with the search text and the star filter (-1 = any, 0 = no star) when the player presses Enter. Return a report with <see cref="SearchOutcome.NoMatchingQuality"/> to keep the menu open; its FoundTerms tell the menu whether anything was found (the history is only written then).</param>
+        /// <param name="history">The recent searches (word + the star filter used), newest first. The menu edits this list directly.</param>
         /// <param name="onHistoryChanged">Called after the history list was changed, so the caller can save it.</param>
         /// <param name="leakedChar">The character of the key that opened this menu, if it types a character. It is removed if it leaks into the text box.</param>
         /// <param name="getSuggestions">Returns the auto-complete suggestions for the text typed so far. Null = no drop-down at all.</param>
-        public SearchMenu(Func<string, int, SearchOutcome> onConfirm, List<string> history, Action onHistoryChanged, string? leakedChar = null, Func<string, IReadOnlyList<Suggestion>>? getSuggestions = null)
+        public SearchMenu(Func<string, int, SearchReport> onConfirm, List<SearchHistoryEntry> history, Action onHistoryChanged, string? leakedChar = null, Func<string, IReadOnlyList<Suggestion>>? getSuggestions = null)
             : base(
                 Game1.uiViewport.Width / 2 - 320,
                 Game1.uiViewport.Height / 2 - (MenuHeight + ExtraHeightFor(history)) / 2,
@@ -168,6 +286,7 @@ namespace ChestItemFinder
             this.onHistoryChanged = onHistoryChanged;
             this.extraHeight = ExtraHeightFor(history);
             this.getSuggestions = getSuggestions;
+            this.qualityIndex = Math.Clamp(lastQualityIndex, 0, QualityValues.Length - 1);   // reopen with the star the player used last
 
             // the star button sits at the right end of the search row; the text box is shortened to make room
             const int starSize = 48;
@@ -198,7 +317,7 @@ namespace ChestItemFinder
         /// <summary>
         /// Whether the query may be searched. Empty is never allowed; 3+ characters is allowed;
         /// shorter queries are allowed only if they are a pure number (item ID, or negative category ID).
-        /// Uses the same number rule as BuildMatcher in ModEntry.
+        /// Uses the same number rule as BuildSingleMatcher in ModEntry.
         /// </summary>
         private static bool IsQueryValid(string query)
         {
@@ -209,8 +328,78 @@ namespace ChestItemFinder
             return int.TryParse(query, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out _);
         }
 
+        /// <summary>
+        /// Whether ONE word of a query with several words can be searched at all: it is long enough (or a number), it is not only symbols and it has
+        /// no character that cannot belong to an item name. A word that fails this is never searched; the search reports it as "(Invalid: ...)"
+        /// in the result title (ModEntry.ScanChests) instead of refusing the whole query.
+        /// </summary>
+        internal static bool IsTermSearchable(string term)
+        {
+            return IsQueryValid(term) && !IsSymbolsOnly(term) && !HasInvalidCharacters(term);
+        }
+
+        /// <summary>
+        /// True if the query is nothing but symbols (like "&amp;@#!", "---" or "((("): it has no letter and no digit at all, but is not empty.
+        /// Round brackets and the minus sign count as symbols here too; they only matter together with a letter or a digit
+        /// ("fruit (category)", "-26", "-2"), and such a query has one, so it passes.
+        /// </summary>
+        private static bool IsSymbolsOnly(string query)
+        {
+            bool hasCharacter = false;
+            foreach (char ch in query)
+            {
+                if (char.IsLetterOrDigit(ch))
+                    return false;
+                if (!char.IsWhiteSpace(ch))
+                    hasCharacter = true;
+            }
+            return hasCharacter;   // an empty query is not "only symbols": it gets the "too short" hint
+        }
+
+        /// <summary>
+        /// True if the query still contains a round bracket, half-width or full-width. Call it with the query AFTER the legal
+        /// " (category)" label was cut off: the only legal use of brackets is that label, so any bracket left over
+        /// ("(ca", "cat)", "fruit (cate", "fruit (categry)", "(category) fruit (something)") means the query is invalid.
+        /// </summary>
+        private static bool HasStrayBrackets(string plainQuery)
+        {
+            return plainQuery.IndexOfAny(BracketChars) >= 0;
+        }
+
+        /// <summary>
+        /// True if the query contains a character that cannot belong to an item name: anything except letters, digits, white space,
+        /// accent / vowel-sign marks and the symbols of <see cref="AllowedPunctuation"/> ("*$f", "ab@cd", "fruit#", emoji ...).
+        /// Call it with the query AFTER the " (category)" label was cut off. Letters of every language count as letters, so
+        /// translated item names (Chinese, Korean, Russian, accents like "Pi�a") are fine.
+        /// </summary>
+        private static bool HasInvalidCharacters(string plainQuery)
+        {
+            foreach (char ch in plainQuery)
+            {
+                if (char.IsLetterOrDigit(ch) || char.IsWhiteSpace(ch) || AllowedPunctuation.IndexOf(ch) >= 0)
+                    continue;
+
+                // accents and vowel signs that are stored as a separate character (many scripts need them inside a word)
+                UnicodeCategory category = char.GetUnicodeCategory(ch);
+                if (category == UnicodeCategory.NonSpacingMark || category == UnicodeCategory.SpacingCombiningMark)
+                    continue;
+
+                return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Used for a query of several words: true if this one word cannot be part of a search, because it has no letter or digit at all ("&amp;&amp;&amp;", "-")
+        /// or contains a character that cannot belong to an item name ("fr&amp;", "ab@cd"). Brackets are handled before this by their own hint.
+        /// </summary>
+        private static bool IsInvalidSymbolWord(string word)
+        {
+            return IsSymbolsOnly(word) || HasInvalidCharacters(word);
+        }
+
         /// <summary>How much taller the menu must be to hold the history block (0 when there is no history).</summary>
-        private static int ExtraHeightFor(List<string> history)
+        private static int ExtraHeightFor(List<SearchHistoryEntry> history)
         {
             int rows = CountHistoryRows(history);
             if (rows == 0)
@@ -218,34 +407,270 @@ namespace ChestItemFinder
             return HistoryRowsTop + rows * HistoryRowHeight + HistoryFooterGap - 256;
         }
 
-        /// <summary>Puts a search word at the front of the history (no duplicates, case-insensitive, at most <see cref="MaxHistory"/>).</summary>
-        private void RecordHistory(string query)
+        /// <summary>
+        /// Puts a finished search at the front of the history, as ONE entry made of ALL the words the player typed
+        /// (<paramref name="typedTerms"/>, joined as "a, b", including words that found nothing: "fish, ere" stays "fish, ere") together with the
+        /// star filter it was searched with. The history holds plain words only (no brackets, no numbers): a word that is an item id or a
+        /// category id ("268", "-4") is stored as its name ("Starfruit", "fish"), see <see cref="TryGetIdName"/>; an id without a name stays
+        /// the number. Then the old entries are cleaned:
+        ///   - "prefix swallowing": an old word that is the start of (or equal to) a new word is removed, so the newest, most complete
+        ///     spelling is the only one left ("frui" is swallowed by "fruit"). This works word by word: an old entry "frui, fish" loses only "frui",
+        ///     and an old entry with no words left is removed completely. The star of the old entry does not matter.
+        ///     Two kinds of old words are only swallowed by an EXACT repeat, never by a longer word: category words ("fish" must not be eaten by
+        ///     "Fishing Rod") and numbers ("26" must not be eaten by "268"), because those are finished searches, not half-typed words.
+        ///   - at most <see cref="MaxHistory"/> entries.
+        /// </summary>
+        private void RecordHistory(IReadOnlyList<string> typedTerms, int quality)
         {
-            if (query.Length == 0)
+            var newTerms = new List<string>();   // as stored, e.g. "Starfruit"
+            var newKeys = new List<string>();    // what old words are compared with (the name of an id, so "starf" is still swallowed by "Starfruit")
+            var newIds = new List<string>();     // the plain numbers among the new words ("268", "-26")
+            foreach (string raw in typedTerms)
+            {
+                string term = (raw ?? "").Trim();
+                bool isNumber = int.TryParse(term, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out _);
+                string? idName = TryGetIdName(term);
+
+                string text = idName ?? term;   // plain word: the name of an id, or the word itself (the number if no name is known)
+                string key = isNumber && idName == null ? "#" + term : SuggestionIndex.MakeKey(idName ?? term);   // "-26" and "26" are different searches, though the key drops the hyphen
+                if (key.Length == 0 || newKeys.Contains(key))
+                    continue;
+
+                newTerms.Add(text);
+                newKeys.Add(key);
+                if (isNumber)
+                    newIds.Add(term);
+            }
+
+            if (newTerms.Count == 0)
                 return;
 
-            history.RemoveAll(h => string.Equals(h, query, StringComparison.OrdinalIgnoreCase));
-            history.Insert(0, query);
+            for (int i = history.Count - 1; i >= 0; i--)
+            {
+                // the words of the old entry as they are stored (an id keeps its "(name)" label)
+                List<string> oldTerms = history[i].Word
+                    .Split(ModEntry.QueryCommas, StringSplitOptions.RemoveEmptyEntries)
+                    .Select(w => w.Trim())
+                    .Where(w => w.Length > 0)
+                    .ToList();
+                if (oldTerms.Count == 0)
+                    continue;
+
+                List<string> kept = oldTerms.Where(old => !IsSwallowed(old, newIds, newKeys)).ToList();
+                if (kept.Count == oldTerms.Count)
+                    continue;   // nothing of this entry was swallowed: it stays exactly as it is
+
+                if (kept.Count == 0)
+                    history.RemoveAt(i);
+                else
+                    history[i].Word = string.Join(", ", kept);
+            }
+
+            history.Insert(0, new SearchHistoryEntry { Word = string.Join(", ", newTerms), Quality = quality });
             if (history.Count > MaxHistory)
                 history.RemoveRange(MaxHistory, history.Count - MaxHistory);
 
             onHistoryChanged();
         }
 
+        /// <summary>
+        /// Category ids and the word the search understands as that category (every word here is checked with ModEntry.IsCategoryWord before it is used,
+        /// so a stored name always searches a category again). Some game words cover a sibling id as well ("artisan goods" = -26 and -27, "mineral" = -2 and -12).
+        /// </summary>
+        internal static readonly Dictionary<int, string> CategoryNamesById = new()
+        {
+            [-2] = "gem",
+            [-4] = "fish",
+            [-5] = "egg",
+            [-6] = "milk",
+            [-7] = "cooking",
+            [-8] = "crafting",
+            [-9] = "big craftable",
+            [-12] = "mineral",
+            [-14] = "meat",
+            [-15] = "metal resources",
+            [-16] = "building resources",
+            [-19] = "fertilizer",
+            [-20] = "junk",
+            [-21] = "bait",
+            [-22] = "fishing tackle",
+            [-24] = "furniture",
+            [-25] = "ingredient",
+            [-26] = "artisan goods",
+            [-27] = "syrup",
+            [-28] = "monster loot",
+            [-29] = "equipment",
+            [-74] = "seed",
+            [-75] = "vegetable",
+            [-79] = "fruit",
+            [-80] = "flower",
+            [-81] = "forage",
+            [-95] = "hat",
+            [-96] = "ring",
+            [-97] = "boots",
+            [-98] = "weapon",
+            [-99] = "tool",
+            [-100] = "clothing",
+            [-101] = "trinket",
+            [-102] = "book",
+            [-103] = "skill book",
+            [-999] = "litter"
+        };
+
+        /// <summary>
+        /// The real name of an id search word, or null. A pure number is an id for the search: negative = category id ("-26" -> "artisan goods"),
+        /// otherwise the id of an object ("268" -> "Starfruit", the game's display name). Null for anything that is not a number, for an id without a
+        /// usable name, and for a name that could not be read back as a label (it contains brackets or a search separator). Used for the history
+        /// and for the title of the result panel (ModEntry).
+        /// </summary>
+        internal static string? TryGetIdName(string term)
+        {
+            string trimmed = (term ?? "").Trim();
+            if (!int.TryParse(trimmed, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out int number))
+                return null;
+
+            try
+            {
+                string? name = null;
+
+                if (number < 0)
+                {
+                    if (CategoryNamesById.TryGetValue(number, out string? category) && ModEntry.IsCategoryWord(category))
+                        name = category;
+                }
+                else
+                {
+                    name = ItemRegistry.GetData("(O)" + number.ToString(CultureInfo.InvariantCulture))?.DisplayName?.Trim();
+                }
+
+                if (string.IsNullOrWhiteSpace(name)
+                    || name.StartsWith("[", StringComparison.Ordinal)
+                    || name.StartsWith("Error", StringComparison.OrdinalIgnoreCase)
+                    || !name.Any(char.IsLetterOrDigit))
+                    return null;
+
+                // the label "(name)" must survive a round trip through the search box
+                if (name.IndexOfAny(ModEntry.QueryCommas) >= 0 || name.IndexOfAny(BracketChars) >= 0)
+                    return null;
+
+                return name;
+            }
+            catch (Exception)
+            {
+                return null;   // no name available: the number stays as it is
+            }
+        }
+
+        /// <summary>True if a word of an old history entry is replaced by one of the new words (see <see cref="RecordHistory"/>).</summary>
+        private static bool IsSwallowed(string oldTerm, List<string> newIds, List<string> newKeys)
+        {
+            string trimmed = oldTerm.Trim();
+
+            // an id word ("268", "-26", or "268 (Starfruit)" with its label) is only replaced by the very same number
+            string plain = ModEntry.StripCategorySuffix(trimmed);   // also cuts the "(name)" label of an id
+            if (int.TryParse(plain, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out _))
+                return newIds.Any(id => string.Equals(id, plain, StringComparison.Ordinal));
+
+            string oldKey = SuggestionIndex.MakeKey(trimmed);
+            if (oldKey.Length == 0)
+                return false;
+
+            bool exactOnly = ModEntry.IsCategoryWord(trimmed);
+            foreach (string newKey in newKeys)
+            {
+                if (newKey == oldKey)
+                    return true;
+                if (!exactOnly && newKey.StartsWith(oldKey, StringComparison.Ordinal))
+                    return true;
+            }
+
+            return false;
+        }
+
         private void Confirm()
         {
             // a suggestion picked with the arrow keys wins over the typed text
             if (SuggestionsVisible && activeSuggestion >= 0 && activeSuggestion < suggestions.Count)
-                textBox.Text = suggestions[activeSuggestion].Text;
+                textBox.Text = ApplySuggestion(activeSuggestion);
 
             string query = textBox.Text.Trim();
 
-            // every Enter is remembered: found or not, valid or not
-            RecordHistory(query);
+            // the player typed something, but all of it was white space (spaces, tabs): that is not a typo that is "too short", so it gets
+            // its own hint. A completely empty box (nothing typed) still gets the "too short" hint, and "  fruit  " is trimmed to "fruit" and searched normally.
+            bool blankOnly = textBox.Text.Length > 0 && query.Length == 0;
 
-            if (!IsQueryValid(query))
+            // "fruit (category)" is the same search as "fruit": the history keeps the plain word, and the length rule looks at the plain word.
+            // Words separated by commas ("fruit, fish", half-width or full-width comma) are separate search terms; the history keeps them as
+            // "fruit, fish". Without a comma the whole text is one term for the length rule (spaces inside it are not split there: whether
+            // "fruit fish" is two words is decided by the search itself, see ModEntry.SplitBySpaces).
+            bool hasCommas = ModEntry.HasCommas(query);
+            string plainQuery = ModEntry.NormalizeQueryText(query);
+            List<string> terms = hasCommas ? ModEntry.GetCommaTerms(query) : new List<string> { plainQuery };
+            string checkedText = string.Join(" ", terms);   // all terms together, for the checks that only look for a bad character
+
+            // every word of the query, split at the commas AND at the spaces (the legal " (category)" label is already gone)
+            List<string> words = checkedText.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).ToList();
+
+            // Refusals, all without touching the history (a refused query is never remembered). They block the search, keep the menu open, play
+            // the game's "cancel" cue and show one red hint.
+            //
+            // ONE word (or nothing), as always, in this order: only spaces / tabs, only symbols, too short, invalid brackets, invalid characters.
+            //   "fruit&&&" is one word with a bad character: refused as a whole ("Invalid characters ...").
+            //
+            // SEVERAL words ("fruit, &&&", "fruit &&&", "fruit, fi", "fruit ere"): a bad word no longer refuses the query. Stray brackets still refuse
+            // it (they are a mistake in the syntax, not a word). Otherwise the query is refused only when NOT ONE word can be searched at all:
+            //   - with commas: no comma-separated term passes IsTermSearchable (too short, only symbols, bad character);
+            //   - without commas: the text as a whole is too short, or every space-separated word is only symbols / has a bad character
+            //     (item names contain short words ("Pale Ale"), so the length rule looks at the whole text; the search itself splits it, see
+            //     ModEntry.SplitBySpaces).
+            // Every word that cannot be searched, and every word that finds nothing, is then listed as "(Invalid: ...)" in the title of the result
+            // panel (ModEntry.ScanChests), and the search counts as a success as soon as one word finds something.
+            string? refusal = null;
+            if (blankOnly)
             {
-                // block the search, keep the menu open, and show the hint
+                refusal = BlankHintText;
+            }
+            else if (words.Count >= 2)
+            {
+                bool severalTerms = hasCommas && terms.Count >= 2;
+
+                if (HasStrayBrackets(checkedText))
+                {
+                    refusal = InvalidBracketsHintText;
+                }
+                else
+                {
+                    bool nothingSearchable = hasCommas
+                        ? !terms.Any(IsTermSearchable)
+                        : (!IsQueryValid(plainQuery) || words.All(IsInvalidSymbolWord));
+
+                    if (nothingSearchable)
+                    {
+                        refusal = words.Any(IsInvalidSymbolWord) ? MultiInvalidSymbolsHintText
+                            : severalTerms ? MultiTooShortHintText
+                            : TooShortHintText;
+                    }
+                }
+            }
+            else
+            {
+                // (a query that is only commas, like ",", has no letter or digit, so it counts as "only symbols")
+                bool symbolsOnly = IsSymbolsOnly(ModEntry.StripCategorySuffix(query)) || terms.Any(IsSymbolsOnly);
+                bool tooShort = terms.Count == 0 || terms.Any(term => !IsQueryValid(term));
+                bool strayBrackets = HasStrayBrackets(checkedText);
+                bool invalidCharacters = HasInvalidCharacters(checkedText);
+
+                refusal = symbolsOnly ? SymbolsOnlyHintText
+                    : tooShort ? TooShortHintText
+                    : strayBrackets ? InvalidBracketsHintText
+                    : invalidCharacters ? InvalidCharactersHintText
+                    : null;
+            }
+
+            if (refusal != null)
+            {
+                Game1.playSound(RefusedSound);
+                validationHintText = refusal;
                 showTooShortHint = true;
                 showNoQualityHint = false;
                 lastText = textBox.Text;
@@ -255,9 +680,11 @@ namespace ChestItemFinder
                 return;
             }
 
-            SearchOutcome outcome = onConfirm(query, QualityValues[qualityIndex]);
+            // the query passed the checks: search. Only afterwards is the history updated: a search that found nothing at all is not remembered;
+            // otherwise the WHOLE typed query is, including words that found nothing ("fish, ere" stays "fish, ere").
+            SearchReport report = onConfirm(query, QualityValues[qualityIndex]);
 
-            if (outcome == SearchOutcome.NoMatchingQuality)
+            if (report.Outcome == SearchOutcome.NoMatchingQuality)
             {
                 // the item exists but not in this quality: stay open so the player can change the star and search again
                 showNoQualityHint = true;
@@ -267,6 +694,20 @@ namespace ChestItemFinder
                 textBox.Selected = true;
                 Game1.keyboardDispatcher.Subscriber = textBox;
                 return;
+            }
+
+            if (report.FoundTerms.Count > 0)
+            {
+                // "268 -4" (numbers only, separated by spaces) is two words for the history, so each id gets its name
+                List<string> historyTerms = terms;
+                if (!hasCommas)
+                {
+                    string[] tokens = plainQuery.Split(SpaceChars, StringSplitOptions.RemoveEmptyEntries);
+                    if (tokens.Length >= 2 && tokens.All(t => int.TryParse(t, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out _)))
+                        historyTerms = tokens.ToList();
+                }
+
+                RecordHistory(historyTerms, QualityValues[qualityIndex]);
             }
 
             exitThisMenu();
@@ -296,6 +737,16 @@ namespace ChestItemFinder
                 showNoQualityHint = false;
                 RefreshSuggestions();
             }
+
+            // dragging the scrollbar knob: follow the mouse while the left button is held, stop as soon as it is released
+            // (polled here as well as in releaseLeftClick, so a release outside the window can never leave the knob stuck to the mouse)
+            if (draggingScrollbar)
+            {
+                if (Game1.input.GetMouseState().LeftButton != ButtonState.Pressed || !SuggestionsVisible || !NeedsScrollbar)
+                    draggingScrollbar = false;
+                else
+                    SetScrollFromMouse(Game1.getMouseY());
+            }
         }
 
         public override void receiveKeyPress(Keys key)
@@ -310,24 +761,26 @@ namespace ChestItemFinder
             if (!SuggestionsVisible)
                 return;
 
-            int rows = VisibleSuggestionRows;
+            int total = suggestions.Count;
 
             switch (key)
             {
                 case Keys.Down:
-                    // none -> first -> ... -> last -> none (back to the typed text, like Google)
-                    activeSuggestion = activeSuggestion + 1 >= rows ? -1 : activeSuggestion + 1;
+                    // none -> first -> ... -> last -> none (back to the typed text, like Google); the list scrolls along to keep the pick visible
+                    activeSuggestion = activeSuggestion + 1 >= total ? -1 : activeSuggestion + 1;
+                    EnsureActiveSuggestionVisible();
                     Game1.playSound("smallSelect");
                     break;
 
                 case Keys.Up:
-                    activeSuggestion = activeSuggestion < 0 ? rows - 1 : activeSuggestion - 1;
+                    activeSuggestion = activeSuggestion < 0 ? total - 1 : activeSuggestion - 1;
+                    EnsureActiveSuggestionVisible();
                     Game1.playSound("smallSelect");
                     break;
 
                 case Keys.Tab:
                     // complete the text with the picked suggestion (or the top one) without searching yet
-                    textBox.Text = suggestions[activeSuggestion >= 0 ? activeSuggestion : 0].Text;
+                    textBox.Text = ApplySuggestion(activeSuggestion >= 0 ? activeSuggestion : 0);
                     activeSuggestion = -1;
                     Game1.playSound("smallSelect");
                     break;
@@ -336,14 +789,39 @@ namespace ChestItemFinder
 
         public override void receiveLeftClick(int x, int y, bool playSound = true)
         {
-            // a click inside the drop-down: on a row = search for that item; on the frame = swallowed
+            // a click inside the drop-down: on the scrollbar = grab / jump; on a row = search for that item; on the frame = swallowed
             if (SuggestionsVisible && GetSuggestionBounds().Contains(x, y))
             {
+                if (NeedsScrollbar)
+                {
+                    Rectangle runner = GetScrollbarRunner();
+                    Rectangle grabArea = runner;
+                    grabArea.Inflate(ScrollbarHitPad, 0);
+
+                    if (grabArea.Contains(x, y))
+                    {
+                        Rectangle thumb = GetScrollbarThumb();
+                        if (thumb.Contains(x, y))
+                        {
+                            scrollbarGrabOffset = y - thumb.Y;   // grabbed the knob: it keeps its position under the mouse
+                        }
+                        else
+                        {
+                            scrollbarGrabOffset = thumb.Height / 2;   // clicked the empty track: the knob jumps there (centered on the mouse), then follows
+                            if (SetScrollFromMouse(y))
+                                Game1.playSound("shiny4");
+                        }
+
+                        draggingScrollbar = true;
+                        return;
+                    }
+                }
+
                 int row = GetSuggestionRowAt(x, y);
                 if (row >= 0)
                 {
                     Game1.playSound("smallSelect");
-                    textBox.Text = suggestions[row].Text;
+                    textBox.Text = ApplySuggestion(suggestionScroll + row);
                     activeSuggestion = -1;
                     Confirm();   // may close the menu, so nothing else may touch the text box afterwards
                 }
@@ -354,6 +832,17 @@ namespace ChestItemFinder
             if (CloseButtonVisible && CloseButtonBounds.Contains(x, y))
             {
                 exitThisMenu();
+                return;
+            }
+
+            // the red x inside the search box (only while there is text): empties the box and keeps the focus there, so the player can type on.
+            // update() notices the changed text: it hides the red hints, refreshes the drop-down (nothing to suggest) and brings the history back.
+            if (ClearTextVisible && ClearTextBounds.Contains(x, y))
+            {
+                textBox.Text = "";
+                Game1.playSound("smallSelect");
+                textBox.Selected = true;
+                Game1.keyboardDispatcher.Subscriber = textBox;
                 return;
             }
 
@@ -397,7 +886,7 @@ namespace ChestItemFinder
                         // the small red x: remove just this word (the list is laid out again on the next frame)
                         if (chip.Remove.Contains(x, y))
                         {
-                            history.RemoveAll(h => string.Equals(h, chip.Word, StringComparison.OrdinalIgnoreCase));
+                            history.RemoveAll(h => string.Equals(h.Word, chip.Word, StringComparison.OrdinalIgnoreCase));
                             onHistoryChanged();
                             Game1.playSound("trashcan");
                             break;
@@ -406,8 +895,12 @@ namespace ChestItemFinder
                         if (!chip.Bounds.Contains(x, y))
                             continue;
 
-                        // fill the word into the search box
+                        // fill the word into the search box, and put the star button back to what it was when this word was searched
+                        // (an entry without a star, e.g. from an older save, or an unknown value: any quality)
                         textBox.Text = chip.Word;
+                        SearchHistoryEntry? picked = history.Find(h => string.Equals(h.Word, chip.Word, StringComparison.OrdinalIgnoreCase));
+                        qualityIndex = picked == null ? 0 : Math.Max(Array.IndexOf(QualityValues, picked.Quality), 0);
+                        lastQualityIndex = qualityIndex;   // same as clicking the star button: the next search box opens with it
                         SuppressSuggestions();   // the player picked a finished search: no drop-down on top of it
                         showTooShortHint = false;
                         showNoQualityHint = false;
@@ -421,6 +914,7 @@ namespace ChestItemFinder
             {
                 // outline star (any) -> silver -> gold -> iridium -> empty frame (no quality) -> outline star ...
                 qualityIndex = (qualityIndex + 1) % QualityValues.Length;
+                lastQualityIndex = qualityIndex;   // remember it for the next time the search box opens
                 showNoQualityHint = false;
                 Game1.playSound("smallSelect");
             }
@@ -429,11 +923,36 @@ namespace ChestItemFinder
             Game1.keyboardDispatcher.Subscriber = textBox;
         }
 
+        public override void releaseLeftClick(int x, int y)
+        {
+            draggingScrollbar = false;
+            base.releaseLeftClick(x, y);
+        }
+
+        /// <summary>Mouse wheel: scrolls the drop-down one row per notch, but only while the mouse is over it and it has a scrollbar.</summary>
+        public override void receiveScrollWheelAction(int direction)
+        {
+            if (direction == 0 || !SuggestionsVisible || !NeedsScrollbar
+                || !GetSuggestionBounds().Contains(Game1.getMouseX(), Game1.getMouseY()))
+            {
+                base.receiveScrollWheelAction(direction);
+                return;
+            }
+
+            // wheel up (positive) = towards the top of the list
+            if (SetScroll(suggestionScroll + (direction > 0 ? -1 : 1)))
+                Game1.playSound("shiny4");
+        }
+
         // ===================== SEARCH SUGGESTIONS (auto-complete drop-down) =====================
         // A parchment box that drops down from the text box while the player types. It is drawn on top of everything
         // below the text box (like Google's list) and is refreshed whenever the text changes, never while drawing.
         //   mouse:  hovering highlights a row, a click searches for that item
         //   keys:   Down / Up move the highlight, Enter searches the highlighted item, Tab fills it into the box
+        //   scroll: with more suggestions than rows (MaxVisibleSuggestions) a scrollbar appears at the right edge of the list;
+        //           it can be dragged, clicked, or the mouse wheel can be used while the mouse is over the list.
+        //           Down / Up keep the highlighted row in view by scrolling along; scrolling the list away from the highlighted
+        //           row drops the keyboard highlight (Enter then searches the typed text again), so Enter never picks an unseen row.
 
         /// <summary>The drop-down is shown while there is something to show and no hint line needs the space.</summary>
         private bool SuggestionsVisible =>
@@ -445,16 +964,22 @@ namespace ChestItemFinder
 
         private int SuggestionRowHeight => Math.Max(MinSuggestionRowHeight, Game1.smallFont.LineSpacing + 8);
 
-        /// <summary>How many rows fit: at most the whole list, fewer on a very small screen.</summary>
+        /// <summary>How many rows are shown at once: at most <see cref="MaxVisibleSuggestions"/>, fewer on a very small screen or for a short list.</summary>
         private int VisibleSuggestionRows
         {
             get
             {
                 int top = textBox.Y + textBox.Height + SuggestionGap;
                 int room = Game1.uiViewport.Height - top - 12 - SuggestionPadY * 2;
-                return Math.Max(0, Math.Min(suggestions.Count, room / SuggestionRowHeight));
+                return Math.Max(0, Math.Min(Math.Min(suggestions.Count, MaxVisibleSuggestions), room / SuggestionRowHeight));
             }
         }
+
+        /// <summary>True when the list is longer than the rows shown, so the scrollbar is needed (and the rows are a little narrower to make room for it).</summary>
+        private bool NeedsScrollbar => VisibleSuggestionRows > 0 && suggestions.Count > VisibleSuggestionRows;
+
+        /// <summary>The largest value of <see cref="suggestionScroll"/>: the first row of the last full page.</summary>
+        private int MaxSuggestionScroll => Math.Max(0, suggestions.Count - VisibleSuggestionRows);
 
         private Rectangle GetSuggestionBounds()
         {
@@ -465,17 +990,87 @@ namespace ChestItemFinder
                 VisibleSuggestionRows * SuggestionRowHeight + SuggestionPadY * 2);
         }
 
-        /// <summary>The row under a screen position, or -1.</summary>
+        /// <summary>How much of the inside width the scrollbar takes away from the rows (0 without a scrollbar).</summary>
+        private int ScrollbarReserve => NeedsScrollbar ? ScrollbarWidth + ScrollbarGap : 0;
+
+        /// <summary>The visible row (0 = first row on screen) under a screen position, or -1. The scrollbar column does not count as a row.</summary>
         private int GetSuggestionRowAt(int x, int y)
         {
             Rectangle box = GetSuggestionBounds();
             int firstRowTop = box.Y + SuggestionPadY;
 
-            if (x < box.X + SuggestionPadX || x >= box.Right - SuggestionPadX || y < firstRowTop)
+            if (x < box.X + SuggestionPadX || x >= box.Right - SuggestionPadX - ScrollbarReserve || y < firstRowTop)
                 return -1;
 
             int row = (y - firstRowTop) / SuggestionRowHeight;
             return row < VisibleSuggestionRows ? row : -1;
+        }
+
+        /// <summary>The track of the scrollbar: right end of the rows area, as tall as the visible rows.</summary>
+        private Rectangle GetScrollbarRunner()
+        {
+            Rectangle box = GetSuggestionBounds();
+            return new Rectangle(
+                box.Right - SuggestionPadX - ScrollbarWidth,
+                box.Y + SuggestionPadY,
+                ScrollbarWidth,
+                VisibleSuggestionRows * SuggestionRowHeight);
+        }
+
+        /// <summary>The knob of the scrollbar: its position along the track follows <see cref="suggestionScroll"/>.</summary>
+        private Rectangle GetScrollbarThumb()
+        {
+            Rectangle runner = GetScrollbarRunner();
+            int thumbHeight = Math.Min(ScrollbarThumbHeight, runner.Height);
+            int travel = runner.Height - thumbHeight;
+            int max = MaxSuggestionScroll;
+            int offset = max > 0 ? (int)Math.Round(travel * (double)suggestionScroll / max) : 0;
+            return new Rectangle(runner.X, runner.Y + offset, runner.Width, thumbHeight);
+        }
+
+        /// <summary>Moves the knob so that it follows the mouse (using <see cref="scrollbarGrabOffset"/>). Returns true if the list scrolled.</summary>
+        private bool SetScrollFromMouse(int mouseY)
+        {
+            Rectangle runner = GetScrollbarRunner();
+            int thumbHeight = Math.Min(ScrollbarThumbHeight, runner.Height);
+            int travel = runner.Height - thumbHeight;
+            if (travel <= 0)
+                return false;
+
+            double ratio = (mouseY - scrollbarGrabOffset - runner.Y) / (double)travel;
+            ratio = Math.Clamp(ratio, 0.0, 1.0);
+            return SetScroll((int)Math.Round(ratio * MaxSuggestionScroll));
+        }
+
+        /// <summary>Sets the first visible suggestion (kept within range). Returns true if it changed.</summary>
+        private bool SetScroll(int value)
+        {
+            int clamped = Math.Clamp(value, 0, MaxSuggestionScroll);
+            if (clamped == suggestionScroll)
+                return false;
+
+            suggestionScroll = clamped;
+
+            // scrolling the highlighted row out of view drops the keyboard highlight, so Enter never searches a row the player cannot see
+            if (activeSuggestion >= 0 && (activeSuggestion < suggestionScroll || activeSuggestion >= suggestionScroll + VisibleSuggestionRows))
+                activeSuggestion = -1;
+
+            return true;
+        }
+
+        /// <summary>Scrolls just far enough that the row picked with the arrow keys is on screen.</summary>
+        private void EnsureActiveSuggestionVisible()
+        {
+            if (activeSuggestion < 0)
+                return;
+
+            int rows = VisibleSuggestionRows;
+            if (activeSuggestion < suggestionScroll)
+                suggestionScroll = activeSuggestion;
+            else if (activeSuggestion >= suggestionScroll + rows)
+                suggestionScroll = activeSuggestion - rows + 1;
+
+            suggestionScroll = Math.Clamp(suggestionScroll, 0, MaxSuggestionScroll);
         }
 
         /// <summary>Closes the list and keeps it closed until the text is edited.</summary>
@@ -484,12 +1079,32 @@ namespace ChestItemFinder
             suppressedText = textBox.Text;
             suggestions = Array.Empty<Suggestion>();
             activeSuggestion = -1;
+            suggestionScroll = 0;
+            draggingScrollbar = false;
         }
 
-        /// <summary>Asks for the suggestions of the current text. Called when the text changes.</summary>
+        /// <summary>
+        /// The text box content after picking a suggestion: the words typed before the one being completed stay, the suggestion replaces the rest
+        /// ("fruit, fi" + "Fish" = "fruit, Fish"). With a single word the whole text is replaced, as before.
+        /// </summary>
+        private string ApplySuggestion(int index)
+        {
+            return suggestionPrefix + suggestions[index].Text;
+        }
+
+        /// <summary>
+        /// Asks for the suggestions of the current text. Called when the text changes. Only the word being typed is completed:
+        ///   with a comma in the text, the word after the LAST comma ("fruit, fi" completes "fi"; right after the comma nothing is typed yet, so no list);
+        ///   without a comma, the whole text is completed first (so "star fr" still finds "Starfruit" and "ancient fr" "Ancient Fruit"); only when that finds
+        ///   nothing, the last space-separated word is completed on its own ("fruit fi" completes "fi").
+        /// The words in front of it are remembered in <see cref="suggestionPrefix"/>, so picking a suggestion never overwrites them.
+        /// </summary>
         private void RefreshSuggestions()
         {
             activeSuggestion = -1;
+            suggestionScroll = 0;          // a new list always starts at its top
+            draggingScrollbar = false;
+            suggestionPrefix = "";
 
             string text = textBox.Text;
             if (suppressedText != null && text != suppressedText)
@@ -502,13 +1117,37 @@ namespace ChestItemFinder
                 return;
             }
 
-            IReadOnlyList<Suggestion> found = getSuggestions(query);
+            string prefix = "";
+            string term = query;
+            IReadOnlyList<Suggestion> found = Array.Empty<Suggestion>();
+
+            int comma = text.LastIndexOfAny(ModEntry.QueryCommas);   // half-width or full-width
+            if (comma >= 0)
+            {
+                prefix = text.Substring(0, comma + 1).TrimStart() + " ";
+                term = text.Substring(comma + 1).Trim();
+                if (term.Length > 0)
+                    found = getSuggestions(term);
+            }
+            else
+            {
+                found = getSuggestions(query);
+
+                int space = query.LastIndexOfAny(SpaceChars);
+                if (found.Count == 0 && space >= 0)
+                {
+                    prefix = query.Substring(0, space + 1);
+                    term = query.Substring(space + 1);
+                    found = getSuggestions(term);
+                }
+            }
 
             // a list that only repeats what was typed ("Cranberries" -> "Cranberries") is just noise
-            if (found.Count == 1 && !found[0].IsCategory && string.Equals(found[0].Text, query, StringComparison.OrdinalIgnoreCase))
+            if (found.Count == 1 && !found[0].IsCategory && found[0].IdLabel == null && string.Equals(found[0].Text, term, StringComparison.OrdinalIgnoreCase))
                 found = Array.Empty<Suggestion>();
 
             suggestions = found;
+            suggestionPrefix = prefix;
         }
 
         /// <summary>
@@ -521,24 +1160,39 @@ namespace ChestItemFinder
             int rows = VisibleSuggestionRows;
             int rowHeight = SuggestionRowHeight;
             int lineHeight = Game1.smallFont.LineSpacing;
+            int reserve = ScrollbarReserve;
+
+            // keep the window valid even if the list or the screen size changed since the last frame
+            suggestionScroll = Math.Clamp(suggestionScroll, 0, MaxSuggestionScroll);
 
             IClickableMenu.drawTextureBox(b, Game1.menuTexture, new Rectangle(0, 256, 60, 60), box.X, box.Y, box.Width, box.Height, Color.White);
 
-            // the hovered row wins over the arrow-key row (Enter still uses only the arrow-key row)
-            int hovered = GetSuggestionRowAt(Game1.getMouseX(), Game1.getMouseY());
-            int highlighted = hovered >= 0 ? hovered : activeSuggestion;
+            // the hovered row wins over the arrow-key row (Enter still uses only the arrow-key row); no row hover while the knob is being dragged
+            int hoveredRow = draggingScrollbar ? -1 : GetSuggestionRowAt(Game1.getMouseX(), Game1.getMouseY());
+            int highlighted = hoveredRow >= 0 ? suggestionScroll + hoveredRow : activeSuggestion;
 
             for (int i = 0; i < rows; i++)
             {
-                var row = new Rectangle(box.X + SuggestionPadX, box.Y + SuggestionPadY + i * rowHeight, box.Width - SuggestionPadX * 2, rowHeight);
+                int index = suggestionScroll + i;
+                var row = new Rectangle(box.X + SuggestionPadX, box.Y + SuggestionPadY + i * rowHeight, box.Width - SuggestionPadX * 2 - reserve, rowHeight);
 
-                if (i == highlighted)
+                if (index == highlighted)
                     b.Draw(Game1.staminaRect, row, Game1.textColor * 0.16f);
 
-                Suggestion suggestion = suggestions[i];
+                Suggestion suggestion = suggestions[index];
                 var pos = new Vector2(row.X + 10, row.Y + (rowHeight - lineHeight) / 2f);
                 const string CategoryTag = " (category)";
-                float tagWidth = suggestion.IsCategory ? Game1.smallFont.MeasureString(CategoryTag).X : 0f;
+
+                // the tag after the word: " (category)" for a category word, " (Starfruit)" / " (fruit)" (the name of the id) for an id suggestion
+                string? tag = suggestion.IsCategory ? CategoryTag : null;
+                if (suggestion.IdLabel != null)
+                {
+                    int numberWidth = (int)Math.Ceiling(Game1.smallFont.MeasureString(suggestion.Text).X);
+                    int bracketsWidth = (int)Math.Ceiling(Game1.smallFont.MeasureString(" ()").X);
+                    tag = " (" + FitLabel(suggestion.IdLabel, Math.Max(40, row.Width - 20 - numberWidth - bracketsWidth)) + ")";
+                }
+
+                float tagWidth = tag != null ? Game1.smallFont.MeasureString(tag).X : 0f;
                 string label = FitLabel(suggestion.Text, row.Width - 20 - (int)Math.Ceiling(tagWidth));
 
                 if (label == suggestion.Text && suggestion.MatchedLength > 0 && suggestion.MatchedLength < suggestion.Text.Length)
@@ -554,14 +1208,34 @@ namespace ChestItemFinder
                     Utility.drawTextWithShadow(b, label, Game1.smallFont, pos, Game1.textColor);
                 }
 
-                // a category word gets a quiet "(category)" after it; this is display only, the row still searches the plain word
-                if (suggestion.IsCategory)
-                    Utility.drawTextWithShadow(b, CategoryTag, Game1.smallFont, new Vector2(pos.X + Game1.smallFont.MeasureString(label).X, pos.Y), Game1.textColor * 0.6f);
+                // a category word gets a quiet "(category)" after it, an id gets its name in brackets (a little stronger, it is the point of the row);
+                // this is display only: the row still searches / fills in the plain word or number
+                if (tag != null)
+                    Utility.drawTextWithShadow(b, tag, Game1.smallFont, new Vector2(pos.X + Game1.smallFont.MeasureString(label).X, pos.Y), Game1.textColor * (suggestion.IdLabel != null ? 0.8f : 0.6f));
+            }
+
+            // the scrollbar: the game's slider-track box as the track, the game's own 6x10 knob on it
+            if (NeedsScrollbar)
+            {
+                Rectangle runner = GetScrollbarRunner();
+                IClickableMenu.drawTextureBox(b, Game1.mouseCursors, ScrollbarTrackSource, runner.X, runner.Y, runner.Width, runner.Height, Color.White, 4f, false);
+
+                Rectangle thumb = GetScrollbarThumb();
+                b.Draw(Game1.mouseCursors, thumb, ScrollbarThumbSource, Color.White);
             }
         }
 
         /// <summary>The history block is drawn while the search box is empty (and the menu was opened with a history).</summary>
         private bool HistoryAreaVisible => extraHeight > 0 && textBox.Text.Length == 0;
+
+        /// <summary>The quiet getting-started tip under the text box.</summary>
+        private const string TipText = "Tip: Try 'starfruit' or 'fruit (category)'";
+
+        /// <summary>
+        /// The tip shows whenever the text box is completely empty, with or without a history (it sits between the text box and the
+        /// history block, which has room for it), unless a red hint line is using the same spot. It is display only: no click, no hover.
+        /// </summary>
+        private bool TipVisible => textBox.Text.Length == 0 && !showTooShortHint && !showNoQualityHint;
 
         /// <summary>The words and the Clear History button can be clicked only while there is something to pick or clear.</summary>
         private bool HistoryVisible => HistoryAreaVisible && history.Count > 0;
@@ -1026,7 +1700,7 @@ namespace ChestItemFinder
         }
 
         /// <summary>Places the history words left to right, wrapping to a new row when the next word would not fit.</summary>
-        private static List<(string Word, string Label, Rectangle Bounds, Rectangle Remove)> FlowHistory(List<string> history, int left, int right, int top)
+        private static List<(string Word, string Label, Rectangle Bounds, Rectangle Remove)> FlowHistory(List<SearchHistoryEntry> history, int left, int right, int top)
         {
             var result = new List<(string, string, Rectangle, Rectangle)>();
             int lineHeight = Game1.smallFont.LineSpacing;
@@ -1034,8 +1708,9 @@ namespace ChestItemFinder
             int x = left;
             int y = top;
 
-            foreach (string word in history)
+            foreach (SearchHistoryEntry entry in history)
             {
+                string word = entry.Word;
                 string label = FitLabel(word);
                 int w = (int)Game1.smallFont.MeasureString(label).X;
                 int chipWidth = w + HistoryRemoveGap + RemoveMarkSize;   // the word and its x wrap together
@@ -1055,7 +1730,7 @@ namespace ChestItemFinder
             return result;
         }
 
-        private static int CountHistoryRows(List<string> history)
+        private static int CountHistoryRows(List<SearchHistoryEntry> history)
         {
             if (history.Count == 0)
                 return 0;
@@ -1174,23 +1849,33 @@ namespace ChestItemFinder
 
         private void DrawStarButton(SpriteBatch b)
         {
-            IClickableMenu.drawTextureBox(b, Game1.menuTexture, new Rectangle(0, 256, 60, 60), starButton.X, starButton.Y, starButton.Width, starButton.Height, Color.White);
+            DrawQualityButton(b, starButton, QualityValues[qualityIndex], 1f);
+        }
 
-            int quality = QualityValues[qualityIndex];
+        /// <summary>
+        /// Draws a star filter as a framed button: the game's menu box with the star (or outline star, or empty frame) in its middle.
+        /// The star button of the search box and the quality icon of the result panel (ModEntry) both use this, so they always look the same.
+        /// </summary>
+        /// <param name="quality">-1 = any (outline star), 0 = no quality (empty frame), 1 = silver, 2 = gold, 4 = iridium.</param>
+        /// <param name="alpha">1 = fully visible (the result panel fades out, and its icon fades with it).</param>
+        internal static void DrawQualityButton(SpriteBatch b, Rectangle bounds, int quality, float alpha)
+        {
+            IClickableMenu.drawTextureBox(b, Game1.menuTexture, new Rectangle(0, 256, 60, 60), bounds.X, bounds.Y, bounds.Width, bounds.Height, Color.White * alpha);
+
             int starSize = 8 * StarScale;
-            var starPos = new Vector2(starButton.X + (starButton.Width - starSize) / 2, starButton.Y + (starButton.Height - starSize) / 2);
+            var starPos = new Vector2(bounds.X + (bounds.Width - starSize) / 2, bounds.Y + (bounds.Height - starSize) / 2);
 
             if (quality < 0)
             {
                 // "any quality": the same star shape as the real quality stars, drawn as an outline only
-                b.Draw(GetOutlineStarTexture(b.GraphicsDevice), starPos, new Color(130, 75, 35));
+                b.Draw(GetOutlineStarTexture(b.GraphicsDevice), starPos, new Color(130, 75, 35) * alpha);
                 return;
             }
 
             if (quality == 0)
             {
                 // "no quality": an empty frame, the same size, line width and color as the outline star, with no star in it
-                Color frameColor = new Color(130, 75, 35);
+                Color frameColor = new Color(130, 75, 35) * alpha;
                 int fx = (int)starPos.X;
                 int fy = (int)starPos.Y;
                 int t = OutlineThickness;
@@ -1213,7 +1898,7 @@ namespace ChestItemFinder
                 Game1.mouseCursors,
                 starPos,
                 source,
-                Color.White,
+                Color.White * alpha,
                 0f,
                 Vector2.Zero,
                 (float)StarScale,
@@ -1346,6 +2031,65 @@ namespace ChestItemFinder
             }
         }
 
+        // ===================== CLEAR BUTTON (small red x inside the search box, left of the magnifier) =====================
+
+        /// <summary>
+        /// The x is there only while the box holds text (and not in the first frames, while the key that opened the menu may still be in the box:
+        /// it would flash for a moment). With an empty box it is neither drawn nor clickable.
+        /// </summary>
+        private bool ClearTextVisible => ticks >= 3 && textBox.Text.Length > 0;
+
+        /// <summary>The clickable / hoverable area of the x: inside the text box, directly left of the magnifier's area, centered like it.</summary>
+        private Rectangle ClearTextBounds
+        {
+            get
+            {
+                int size = ClearTextSize + ClearTextHitPad * 2;
+                return new Rectangle(
+                    MagnifierBounds.X - ClearTextGap - size,
+                    textBox.Y + (textBox.Height - size) / 2,
+                    size,
+                    size);
+            }
+        }
+
+        /// <summary>
+        /// A small, fine red cross in the same pixel style as the red x of the history words (one cross pixel = 3 screen pixels, drawn with plain
+        /// rectangles, so it is always crisp), with the magnifier's soft shadow. Hover: brighter red and the same soft highlight behind it.
+        /// </summary>
+        private void DrawClearTextButton(SpriteBatch b)
+        {
+            if (!ClearTextVisible)
+                return;
+
+            Rectangle hit = ClearTextBounds;
+            bool hovered = hit.Contains(Game1.getMouseX(), Game1.getMouseY());
+
+            if (hovered)
+                b.Draw(Game1.staminaRect, hit, Game1.textColor * 0.12f);
+
+            int left = hit.X + ClearTextHitPad;
+            int top = hit.Y + ClearTextHitPad;
+
+            DrawClearTextPixels(b, left + ClearTextShadowOffset, top + ClearTextShadowOffset, hovered, shadow: true);
+            DrawClearTextPixels(b, left, top, hovered, shadow: false);
+        }
+
+        private static void DrawClearTextPixels(SpriteBatch b, int left, int top, bool bright, bool shadow)
+        {
+            Color color = shadow ? Color.Black * 0.18f : (bright ? new Color(255, 70, 60) : new Color(220, 30, 30));
+
+            for (int i = 0; i < ClearTextGrid; i++)
+            {
+                b.Draw(Game1.staminaRect, new Rectangle(left + i * ClearTextPixel, top + i * ClearTextPixel, ClearTextPixel, ClearTextPixel), color);
+
+                // the other diagonal; the middle pixel belongs to both, so it is drawn only once (a see-through shadow would get darker there)
+                int mirrored = ClearTextGrid - 1 - i;
+                if (mirrored != i)
+                    b.Draw(Game1.staminaRect, new Rectangle(left + mirrored * ClearTextPixel, top + i * ClearTextPixel, ClearTextPixel, ClearTextPixel), color);
+            }
+        }
+
         // ===================== CLOSE BUTTON (red X, top right) =====================
 
         /// <summary>The red X the game itself uses as the close button of its menus (same sprite, same 12px * 4 = 48px size).</summary>
@@ -1401,6 +2145,7 @@ namespace ChestItemFinder
                 Game1.textColor);
 
             textBox.Draw(b);
+            DrawClearTextButton(b);
             DrawMagnifierButton(b);
             DrawStarButton(b);
             if (CloseButtonVisible)
@@ -1411,7 +2156,7 @@ namespace ChestItemFinder
             {
                 Utility.drawTextWithShadow(
                     b,
-                    "Please enter at least 3 characters",
+                    Game1.parseText(validationHintText, Game1.smallFont, width - 96),   // wraps onto a second line if a hint is too wide (the hint row has room for two)
                     Game1.smallFont,
                     new Vector2(xPositionOnScreen + 48, yPositionOnScreen + 166),
                     Color.DarkRed);
@@ -1429,6 +2174,16 @@ namespace ChestItemFinder
                     Game1.smallFont,
                     new Vector2(xPositionOnScreen + 48, yPositionOnScreen + 166),
                     Color.DarkRed);
+            }
+            else if (TipVisible)
+            {
+                // quiet tip in the free space between the text box and the key hint line (same spot as the red hints, which take its place)
+                Utility.drawTextWithShadow(
+                    b,
+                    FitLabel(TipText, width - 96),
+                    Game1.smallFont,
+                    new Vector2(xPositionOnScreen + 48, yPositionOnScreen + 166),
+                    Color.DimGray * 0.9f);   // a bit deeper than the first Gray * 0.7: readable on the orange box, still quieter than the real text
             }
 
             if (HistoryAreaVisible)

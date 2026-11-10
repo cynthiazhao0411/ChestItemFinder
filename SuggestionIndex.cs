@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
+using System.Globalization;
 using System.Linq;
 using StardewValley;
 using StardewValley.GameData.Objects;
@@ -20,11 +21,18 @@ namespace ChestItemFinder
         /// <summary>True if the search treats <see cref="Text"/> as a whole category ("fruit", "fish" ...). The drop-down then adds "(category)" after it; <see cref="Text"/> itself stays unchanged.</summary>
         public readonly bool IsCategory;
 
-        public Suggestion(string text, int matchedLength, bool isCategory = false)
+        /// <summary>
+        /// For an id suggestion ("268", "-79"): the real name of the id ("Starfruit", "fruit"). The drop-down shows it after the number in brackets
+        /// ("268 (Starfruit)"); <see cref="Text"/> stays the plain number, and that is what a click or Tab puts into the search box. Null for every other suggestion.
+        /// </summary>
+        public readonly string? IdLabel;
+
+        public Suggestion(string text, int matchedLength, bool isCategory = false, string? idLabel = null)
         {
             Text = text;
             MatchedLength = matchedLength;
             IsCategory = isCategory;
+            IdLabel = idLabel;
         }
     }
 
@@ -89,13 +97,29 @@ namespace ChestItemFinder
         /// </summary>
         private static readonly string[] CategoryWords =
         {
-            "artisan goods", "bait", "big craftable", "book", "boots", "building resources", "clothing", "cooking", "crafting",
-            "egg", "equipment", "fertilizer", "fish", "flower", "forage", "fruit", "furniture", "gem", "hat", "ingredient", "junk",
+            "animal product", "artisan goods", "bait", "big craftable", "book", "boots", "building resources", "clothing", "cooking", "crafting",
+            "decor", "egg", "equipment", "fertilizer", "fish", "fishing tackle", "flower", "forage", "fruit", "furniture", "gem", "hat", "ingredient", "junk",
             "meat", "metal resources", "milk", "mineral", "monster loot", "ring", "seed", "skill book", "syrup", "tackle", "tool",
-            "trinket", "vegetable", "weapon"
+            "trash", "trinket", "vegetable", "weapon"
         };
 
+        /// <summary>One id the search understands: an object id ("268") or a category id ("-79"), with its real name.</summary>
+        private readonly struct IdEntry
+        {
+            public readonly string Text;    // the number as typed: "268", "-79"
+            public readonly int Number;
+            public readonly string Label;   // "Starfruit", "fruit, category"
+
+            public IdEntry(string text, int number, string label)
+            {
+                Text = text;
+                Number = number;
+                Label = label;
+            }
+        }
+
         private Entry[] vocabulary = Array.Empty<Entry>();
+        private IdEntry[] idVocabulary = Array.Empty<IdEntry>();
         private Entry[] ownedEntries = Array.Empty<Entry>();
         private HashSet<string> ownedKeys = new();
 
@@ -158,8 +182,86 @@ namespace ChestItemFinder
             }
 
             vocabulary = byKey.Values.ToArray();
+            idVocabulary = BuildIdVocabulary();
             builtFromObjectData = Game1.objectData;
             builtLanguage = LocalizedContentManager.CurrentLanguageCode;
+        }
+
+        /// <summary>
+        /// Every id a player can search for, with its name: the numeric object ids of items that can be held (names from the game's own item data) and the
+        /// category ids of SearchMenu.CategoryNamesById. The name of each id is asked from SearchMenu.TryGetIdName, so the drop-down, the title of the
+        /// result panel and the history always show exactly the same name (and an id without a usable name is not offered).
+        /// </summary>
+        private static IdEntry[] BuildIdVocabulary()
+        {
+            var entries = new List<IdEntry>();
+
+            foreach (IItemDataDefinition type in ItemRegistry.ItemTypes)
+            {
+                if (type.Identifier != "(O)")
+                    continue;
+
+                foreach (string id in type.GetAllIds())
+                {
+                    // plain numbers only ("268"); text ids of other mods cannot be searched by number
+                    if (!int.TryParse(id, NumberStyles.None, CultureInfo.InvariantCulture, out int number)
+                        || number.ToString(CultureInfo.InvariantCulture) != id
+                        || !CanBeHeld(id))
+                        continue;
+
+                    string? label = SearchMenu.TryGetIdName(id);
+                    if (label != null)
+                        entries.Add(new IdEntry(id, number, label));
+                }
+            }
+
+            foreach (int categoryId in SearchMenu.CategoryNamesById.Keys)
+            {
+                if (categoryId == -999)
+                    continue;   // field litter can never be in a chest
+
+                string text = categoryId.ToString(CultureInfo.InvariantCulture);
+                string? label = SearchMenu.TryGetIdName(text);
+                if (label != null)
+                    entries.Add(new IdEntry(text, categoryId, label + ", category"));   // "-79 (fruit, category)": a category id says so
+            }
+
+            return entries.ToArray();
+        }
+
+        /// <summary>True for a number typed as an id: an optional minus and at least one digit, nothing else ("26", "-7"). A lone "-" is not one.</summary>
+        private static bool IsIdQuery(string text)
+        {
+            int start = text.Length > 0 && text[0] == '-' ? 1 : 0;
+            if (text.Length == start)
+                return false;
+
+            for (int i = start; i < text.Length; i++)
+            {
+                if (text[i] < '0' || text[i] > '9')
+                    return false;
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// The ids that start with the typed number, each with its name: the number that equals the typed text first, then shorter numbers, then closer to zero.
+        /// "-7" -> "-7 (cooking, category)", "26" -> "26 (...)", "260 (...)" ... A lone "-" matches every category id (all of them start with it).
+        /// </summary>
+        private IReadOnlyList<Suggestion> SearchIds(string query, int max)
+        {
+            var hits = idVocabulary
+                .Where(entry => entry.Text.StartsWith(query, StringComparison.Ordinal))
+                .OrderBy(entry => entry.Text.Length == query.Length ? 0 : 1)
+                .ThenBy(entry => entry.Text.Length)
+                .ThenBy(entry => Math.Abs((long)entry.Number))
+                .Take(max)
+                .ToList();
+
+            var result = new List<Suggestion>(hits.Count);
+            foreach (IdEntry entry in hits)
+                result.Add(new Suggestion(entry.Text, query.Length, isCategory: false, idLabel: entry.Label));
+            return result;
         }
 
         /// <summary>Quest items and field litter (weeds, twigs, rocks) can never be carried, so they can never be in a chest.</summary>
@@ -206,6 +308,12 @@ namespace ChestItemFinder
         /// <summary>The best <paramref name="max"/> names that start with what the player typed (empty list if nothing fits).</summary>
         public IReadOnlyList<Suggestion> Search(string rawQuery, int max)
         {
+            // a number ("26", "-7") completes to the ids that start with it, each with its name; text is completed as before
+            // (a lone "-" lists the category ids, the ones closest to zero first: -2, -4, -5 ... -79 ...; the player types on, "-7", to narrow it down)
+            string typed = (rawQuery ?? "").Trim();
+            if (typed == "-" || IsIdQuery(typed))
+                return SearchIds(typed, max);
+
             string query = MakeKey(rawQuery);
 
             // nothing typed, or an item / category id like "268" or "-26": ids are not worth completing
