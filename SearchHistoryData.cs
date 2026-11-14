@@ -21,6 +21,13 @@ namespace ChestItemFinder
         /// 1 = silver, 2 = gold, 4 = iridium. Clicking the word in the history puts the star button back to this.
         /// </summary>
         public int Quality { get; set; } = AnyQuality;
+
+        /// <summary>
+        /// Pinned with the small pin next to the word: a pinned entry always stays at the front of the history (pinned entries in the order they were
+        /// pinned), never counts towards the limit of SearchMenu.MaxHistory and is never pushed out by newer searches. Searching it again only updates
+        /// its star. Missing in saves of older versions = not pinned.
+        /// </summary>
+        public bool Pinned { get; set; }
     }
 
     /// <summary>The search history as stored in the save file (newest first).</summary>
