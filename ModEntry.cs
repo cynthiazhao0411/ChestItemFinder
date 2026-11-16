@@ -5405,7 +5405,7 @@ namespace ChestItemFinder
             IClickableMenu.drawTextureBox(b, Game1.menuTexture, new Rectangle(0, 256, 60, 60), keepBoxBounds.X, keepBoxBounds.Y, keepBoxBounds.Width, keepBoxBounds.Height, Color.White * alpha);
 
             // the mouse is over the checkbox itself: a soft highlight behind it (the words are not clickable, so they get none)
-            if (keepCheckHit.Contains(mouse))
+            if (keepBoxBounds.Contains(mouse))   // the whole box is clickable: hovering any part of it lights the checkbox
                 b.Draw(Game1.staminaRect, keepCheckHit, Game1.textColor * 0.12f * alpha);
 
             b.Draw(
@@ -5430,8 +5430,10 @@ namespace ChestItemFinder
                 IClickableMenu.drawHoverText(b, KeepBoxTip, Game1.smallFont, xOffset: keepBoxBounds.X - (Game1.getOldMouseX() + 32));
         }
 
-        // A left click on the checkbox flips it. Only the checkbox counts (the words and the rest of the box do nothing), and the click is
-        // swallowed, so it does not also swing a tool or interact with whatever lies under the box.
+        // A left click anywhere on the box (the checkbox or the words "Keep highlights") flips it, and the click is swallowed, so it does not also
+        // swing a tool or interact with whatever lies under the box.
+        // The mouse is read in UI coordinates (getMousePosition(true)): the box is drawn by the HUD, which uses the UI scale. The plain
+        // getMousePosition() uses the world zoom in this event, so whenever Zoom Level and UI Scale differed the click missed the box (1.6.1 fix).
         private void OnKeepBoxClicked(object? sender, ButtonPressedEventArgs e)
         {
             if (IsHudClickTaken(e.Button))
@@ -5445,7 +5447,7 @@ namespace ChestItemFinder
                 return;   // the box is not on screen right now
             if (keepBoxDismissed && !IsKeepBoxFading(now))
                 return;   // GONE: nothing to click
-            if (!keepCheckHit.Contains(Game1.getMousePosition()))
+            if (!keepBoxBounds.Contains(Game1.getMousePosition(true)))
                 return;
 
             if (keepBoxDismissed)
