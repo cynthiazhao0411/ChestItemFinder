@@ -39,14 +39,31 @@ namespace ChestItemFinder
         /// </summary>
         public readonly string? ViaCategory;
 
-        public Suggestion(string text, int matchedLength, bool isCategory = false, string? idLabel = null, string? qualifiedId = null, string? viaCategory = null)
+        /// <summary>
+        /// For a name the game builds on the fly ("Starfruit Wine"): the qualified id of its ingredient ("(O)268"), so its icon can be drawn in the
+        /// ingredient's colour like the real item (a yellow bottle, not the plain Wine). Null for every other row.
+        /// </summary>
+        public readonly string? IngredientId;
+
+        /// <summary>
+        /// Set only for the row of an alias (SuggestionIndex, ALIASES): the words the player typed ("dried grape"), written dimmed after the game's
+        /// name ("Raisins (dried grape)"), and the note that starts its hover tip ("Dried grapes are called Raisins in the game."). Null otherwise.
+        /// </summary>
+        public readonly string? AliasText;
+        public readonly string? AliasNote;
+
+        public Suggestion(string text, int matchedLength, bool isCategory = false, string? idLabel = null, string? qualifiedId = null, string? viaCategory = null,
+            string? ingredientId = null, string? aliasText = null, string? aliasNote = null)
         {
+            AliasText = aliasText;
+            AliasNote = aliasNote;
             Text = text;
             MatchedLength = matchedLength;
             IsCategory = isCategory;
             IdLabel = idLabel;
             QualifiedId = qualifiedId;
             ViaCategory = viaCategory;
+            IngredientId = ingredientId;
         }
     }
 
@@ -66,11 +83,9 @@ namespace ChestItemFinder
     ///
     /// Order of the drop-down:
     ///   1. the name that equals the typed text, then category words
-    ///   2. names that START with the text before names where a later word starts with it
-    ///   3. at the same way of matching: furniture / decoration / cooking / trash last, late-game items just before them
-    ///   4. the items a player uses the most (ItemRanking), then items that are in your chests, then shorter names, then alphabetical
-    /// On top of that order, THE GLOBAL SLOT RULE (see below) fills the first three rows: best match, most central item, item held the most of.
-    /// "Did you mean" (FindSimilar) uses the same slot rule on its own spelling-based match order.
+    ///   2. then the items in the order of the "Showing results for:" tip for the same text (GetTipNames: items of one root together, the most
+    ///      used root first, furniture / clothing / decoration / dishes last), so the drop-down and the tip always agree
+    /// "Did you mean" (FindSimilar) has its own spelling-based order with THE GLOBAL SLOT RULE (see below).
     /// </remarks>
     internal sealed class SuggestionIndex
     {
@@ -82,14 +97,16 @@ namespace ChestItemFinder
             public readonly string? ItemId;     // qualified id of the item (or of its base product), for the category hover tip; null = unknown
             public readonly bool Built;         // a name the game builds on the fly ("Starfruit Wine"): ItemId is then the id of the BASE PRODUCT (Wine), not of the ingredient
             public readonly bool Unholdable;    // an item the game has but a player can never carry (Weeds, Twig, quest items): kept ONLY to recognise the name and to correct typos of it; never in the drop-down, never in a tip
+            public readonly string? RankId;     // the id its place in every list is worked out from: its own id, but for a built name its INGREDIENT ("Starfruit Wine" -> Starfruit)
 
-            public Entry(string text, string key, string? itemId = null, bool built = false, bool unholdable = false)
+            public Entry(string text, string key, string? itemId = null, bool built = false, bool unholdable = false, string? rankId = null)
             {
                 Text = text;
                 Key = key;
                 ItemId = itemId;
                 Built = built;
                 Unholdable = unholdable;
+                RankId = rankId ?? itemId;
                 WordStarts = FindWordStarts(text);
             }
         }
@@ -113,8 +130,8 @@ namespace ChestItemFinder
                 Rank = rank;
                 bool isCategory = ModEntry.IsCategoryWord(entry.Text);
                 IsCategory = isCategory;
-                Demote = isCategory ? 0 : DemoteLevel(entry.ItemId);
-                Usage = isCategory ? (0, 0) : ItemRanking.Get(entry.ItemId);
+                Demote = isCategory ? 0 : DemoteLevel(entry.RankId);         // a built name ranks like its ingredient (Qi Fruit Wine: late, like Qi Fruit)
+                Usage = isCategory ? (0, 0) : ItemRanking.Get(entry.RankId);
                 OwnedCount = ownedCount;
             }
         }
@@ -292,10 +309,10 @@ namespace ChestItemFinder
 
         /// <summary>
         /// Item kinds (the game's own type prefixes) whose items can lie in a chest and are worth suggesting:
-        /// objects, big craftables, furniture, hats, weapons, tools, boots, trinkets.
-        /// Clothing, wallpaper, flooring and mannequins are left out on purpose (hundreds of look-alike names).
+        /// objects, big craftables, furniture, hats, weapons, tools, boots, trinkets, shirts, pants, mannequins, wallpaper and flooring: EVERY item a
+        /// player can get and put into a chest, whether or not a chest holds it now. Rarely wanted kinds are not left out, only ranked last (ItemRanking).
         /// </summary>
-        private static readonly HashSet<string> IncludedItemTypes = new() { "(O)", "(BC)", "(F)", "(H)", "(W)", "(T)", "(B)", "(TR)" };
+        private static readonly HashSet<string> IncludedItemTypes = new() { "(O)", "(BC)", "(F)", "(H)", "(W)", "(T)", "(B)", "(TR)", "(S)", "(P)", "(M)", "(WP)", "(FL)" };
 
         /// <summary>
         /// Category words offered in the drop-down (names from the Stardew Valley Wiki, Modding:Items, section "Categories", in the spelling
@@ -393,13 +410,13 @@ namespace ChestItemFinder
         private HashSet<string> cheatOnlyKeys = new();
 
         /// <summary>
-        /// Items that are only listed when their category is expanded in the drop-down (typing "clothing" lists every shirt and pair of pants):
-        /// clothing is left out of the normal word list on purpose (hundreds of look-alike names), but a player who asks for the category wants to see it.
+        /// Items that are only listed when their category is expanded in the drop-down. Empty since every item kind is in the normal word list
+        /// (see IncludedItemTypes); kept so another kind could be added this way again.
         /// </summary>
         private Entry[] categoryOnlyEntries = Array.Empty<Entry>();
 
         /// <summary>Item kinds that are only used for the category expansion (see <see cref="categoryOnlyEntries"/>): shirts and pants.</summary>
-        private static readonly HashSet<string> CategoryOnlyItemTypes = new() { "(S)", "(P)" };
+        private static readonly HashSet<string> CategoryOnlyItemTypes = new();   // none any more: shirts and pants are in the word list like every other item
 
         private Entry[] vocabulary = Array.Empty<Entry>();
         private HashSet<string> clutterKeys = new();          // keys of the unholdable names that are pure map clutter (Weeds, Twig, Stone): the only unholdable names the drop-down offers
@@ -408,6 +425,7 @@ namespace ChestItemFinder
         private Dictionary<string, Entry> itemsByInternalName = new(StringComparer.OrdinalIgnoreCase);   // the game's internal English name ("Lava Eel") -> its entry: language independent, for the popular-item tables
         private readonly Dictionary<string, List<Suggestion>> popularCache = new();                   // category -> all of its items, ordered (cleared when the vocabulary is rebuilt)
         private Dictionary<string, Entry> realItemsByKey = new();   // key -> the real item of that name (no built names, no category words): finds the ingredient of "Starfruit Wine"
+        private HashSet<string> knownWordKeys = new();             // every key of the word list (real items, built names, category words)
         private IdEntry[] idVocabulary = Array.Empty<IdEntry>();
         private Entry[] ownedEntries = Array.Empty<Entry>();
         private HashSet<string> ownedKeys = new();
@@ -615,19 +633,568 @@ namespace ChestItemFinder
             }
 
             vocabulary = byKey.Values.ToArray();
+            knownWordKeys = new HashSet<string>(byKey.Keys);
+            itemTextByKey = vocabulary.Where(e => e.ItemId != null).GroupBy(e => e.Key).ToDictionary(g => g.Key, g => g.First().Text, StringComparer.Ordinal);
             cheatOnlyKeys = newCheatOnlyKeys;
             var vocabularyKeys = new HashSet<string>(byKey.Keys);
             categoryOnlyEntries = clothingByKey.Values.Where(e => !vocabularyKeys.Contains(e.Key)).ToArray();
             realItemsByKey = vocabulary.Where(e => !e.Built && e.ItemId != null).ToDictionary(e => e.Key, e => e);
             itemsByInternalName = byInternal;
+            BuildAliases();
             popularCache.Clear();
             idVocabulary = BuildIdVocabulary();
             builtFromObjectData = Game1.objectData;
             builtLanguage = LocalizedContentManager.CurrentLanguageCode;
         }
 
-        /// <summary>Fish with these context tags are not pond fish: they never produce roe (and legendary fish are not processed either).</summary>
-        private static readonly string[] NoProcessingFishTags = { "fish_legendary", "fish_legendary_family", "fish_crab_pot" };
+        /// <summary>
+        /// Fish with these context tags make no roe and no targeted bait (crab pot catches). Legendary fish DO (1.6: they go into ponds, and their
+        /// roe comes from treasure chests too): Legend Roe, Aged Legend Roe, Smoked Legend, Legend Bait all exist.
+        /// </summary>
+        private static readonly string[] NoProcessingFishTags = { "fish_crab_pot" };
+
+        /// <summary>Vegetables a keg turns into a drink of their own (Beer, Pale Ale, Green Tea): no "Wheat Juice" exists (internal names).</summary>
+        private static readonly HashSet<string> KegSpecialIngredients = new(StringComparer.OrdinalIgnoreCase) { "Wheat", "Hops", "Tea Leaves" };
+
+        // ===================== IMPOSSIBLE PRODUCTS: "corn jelly", "apple juice", "carp wine", "fruit juice" =====================
+        // A name the game never makes: an ingredient and a product word that do not go together. The player made something from the
+        // ingredient and only remembers the name wrongly ("I put my corn into a preserves jar, everything else came out as jelly: corn jelly").
+        // So the search box says what the ingredient REALLY becomes, as two lines in the hint spot (SearchMenu, IMPOSSIBLE PRODUCT LINES):
+        //   line 1: "{ingredient} becomes {product} in a {machine}."  (fish pond / bee house: "makes ... in a Fish Pond" / "near a Bee House")
+        //           A. the machine of the typed word takes the ingredient: its product there ("corn jelly" -> Corn becomes Pickled Corn in a
+        //              Preserves Jar; "hops wine" -> Hops becomes Pale Ale in a Keg)
+        //           B. it does not: the product most made from the ingredient ("carp wine" -> Carp makes Carp Roe in a Fish Pond; "dried corn"
+        //              -> Corn becomes Pickled Corn in a Preserves Jar). The ingredient word has the tip "There's no Carp Wine in the game."
+        //   line 2: "Did you mean:" every other product of the ingredient, then the two words apart ("carp, wine") for a player who meant both.
+        // Categories work the same way ("fruit juice" -> Fruit becomes fruit wine in a Keg). Enter on such a text refuses it (the usual refusal
+        // sound, line 1 turns red); nothing is searched. An ingredient that becomes nothing at all ("wood wine") is NOT refused: searched as two words.
+        // Never refused: a name the game knows (also in another singular / plural spelling: "cranberry jelly" = Cranberries Jelly), an alias
+        // ("dried grape" = Raisins, see ALIASES), a text with commas, an unknown word ("xyz wine"), a category that is no ingredient ("egg jelly").
+        // What an ingredient becomes is read from the word list (AddFlavoredNames follows the machine rules, other mods' items included) plus the
+        // machines that make an item of their own (SpecialOutputs).
+
+        /// <summary>What the search box shows for a product the game never makes (see IMPOSSIBLE PRODUCTS).</summary>
+        public sealed class ImpossibleProduct
+        {
+            /// <summary>Line 1 in three parts: Subject + Middle + Link (clickable) + Tail: "Corn" " becomes " "Pickled Corn" " in a Preserves Jar."</summary>
+            public string Subject = "", Middle = "", Link = "", Tail = "";
+            /// <summary>The hover tip of the subject: "There's no Corn Jelly in the game."</summary>
+            public string SubjectTip = "";
+            /// <summary>The name that does not exist, as a title ("Corn Jelly"), for the red line after Enter.</summary>
+            public string Missing = "";
+            /// <summary>Line 2: the other products, best first (the split words come separately).</summary>
+            public List<string> Alternatives = new();
+            /// <summary>The two words apart, for a player who meant both ("corn, jelly"); null for "dried corn" and the like.</summary>
+            public string? Split;
+            /// <summary>The words of <see cref="Split"/> as typed ("corn", "jelly"), for its tip.</summary>
+            public string SplitFirst = "", SplitSecond = "";
+            /// <summary>Product name -> how it is made, for its tip ("Corn becomes Corn Juice in a Keg."; "Corn, Sunflower and Sunflower Seeds make Oil in an Oil Maker.").</summary>
+            public Dictionary<string, string> Sources = new(StringComparer.OrdinalIgnoreCase);
+        }
+
+        /// <summary>The machines (and the fish pond / bee house) that make the products.</summary>
+        private const string Keg = "Keg", Jar = "Preserves Jar", Dehydrator = "Dehydrator", Smoker = "Fish Smoker", BaitMaker = "Bait Maker",
+            Pond = "Fish Pond", BeeHouse = "Bee House", OilMaker = "Oil Maker", Mill = "Mill", CheesePress = "Cheese Press",
+            MayoMachine = "Mayonnaise Machine", Loom = "Loom";
+
+        /// <summary>
+        /// The base ids of the built names, in the order "most made first" (one list for every ingredient: a fruit has 348 / 344 / Dried, a fish
+        /// 812 / 447 / Smoked / Bait ...), with the machine that makes them and whether the INGREDIENT itself goes in (aged roe takes the roe).
+        /// </summary>
+        private static readonly (string BaseId, string Machine, bool Direct)[] BuiltOutputs =
+        {
+            ("(O)812", Pond, true), ("(O)348", Keg, true), ("(O)342", Jar, true), ("(O)344", Jar, true), ("(O)350", Keg, true),
+            ("(O)447", Jar, false), ("(O)DriedFruit", Dehydrator, true), ("(O)DriedMushrooms", Dehydrator, true),
+            ("(O)SmokedFish", Smoker, true), ("(O)SpecificBait", BaitMaker, true), ("(O)340", BeeHouse, true)
+        };
+
+        /// <summary>
+        /// Ingredients a machine turns into an item of its own (internal English names). Rank: where it stands among the ingredient's products
+        /// (-1 = first, it is what the ingredient is made into most; otherwise the position in BuiltOutputs it follows; 99 = last).
+        /// </summary>
+        /// Several ingredients of one output come in FAMILIES (Sunflower and Sunflower Seeds; Egg and Large Egg): whenever they are listed, a
+        /// family stays together, the family of the ingredient in question comes first and that ingredient first in it (see IngredientList).
+        private static readonly (string[][] Families, string Output, string Machine, bool Direct, float Rank)[] SpecialOutputs =
+        {
+            (new[] { new[] { "Wheat" } }, "Beer", Keg, true, -1),
+            (new[] { new[] { "Wheat" } }, "Wheat Flour", Mill, true, 99),
+            (new[] { new[] { "Hops" } }, "Pale Ale", Keg, true, -1),
+            (new[] { new[] { "Tea Leaves" } }, "Green Tea", Keg, true, -1),
+            (new[] { new[] { "Coffee Bean" } }, "Coffee", Keg, true, -1),
+            (new[] { new[] { "Honey" } }, "Mead", Keg, true, -1),
+            (new[] { new[] { "Rice" } }, "Vinegar", Keg, true, -1),
+            (new[] { new[] { "Unmilled Rice" } }, "Rice", Mill, true, -1),
+            (new[] { new[] { "Beet" } }, "Sugar", Mill, true, -1),
+            (new[] { new[] { "Truffle" } }, "Truffle Oil", OilMaker, true, -1),
+            (new[] { new[] { "Sunflower", "Sunflower Seeds" }, new[] { "Corn" } }, "Oil", OilMaker, true, 99),
+            (new[] { new[] { "Grape" } }, "Raisins", Dehydrator, true, 6.5f),
+            (new[] { new[] { "Sturgeon" } }, "Caviar", Jar, false, 0.5f),
+            (new[] { new[] { "Squid", "Midnight Squid" } }, "Squid Ink", Pond, true, -1),
+            (new[] { new[] { "Egg", "Brown Egg", "Large Egg", "Large Brown Egg" }, new[] { "Golden Egg" }, new[] { "Ostrich Egg" } }, "Mayonnaise", MayoMachine, true, -1),
+            (new[] { new[] { "Duck Egg" } }, "Duck Mayonnaise", MayoMachine, true, -1),
+            (new[] { new[] { "Void Egg" } }, "Void Mayonnaise", MayoMachine, true, -1),
+            (new[] { new[] { "Dinosaur Egg" } }, "Dinosaur Mayonnaise", MayoMachine, true, -1),
+            (new[] { new[] { "Milk", "Large Milk" } }, "Cheese", CheesePress, true, -1),
+            (new[] { new[] { "Goat Milk", "L. Goat Milk", "Large Goat Milk" } }, "Goat Cheese", CheesePress, true, -1),
+            (new[] { new[] { "Wool" } }, "Cloth", Loom, true, -1)
+        };
+
+        /// <summary>
+        /// The ingredients of a special output as the game shows them, each once: families together, the family of <paramref name="firstKey"/>
+        /// first and that ingredient first in it ("sunflower": Sunflower, Sunflower Seeds, Corn; "corn": Corn, Sunflower, Sunflower Seeds).
+        /// Ingredients this game does not have are left out.
+        /// </summary>
+        private List<string> IngredientList(string[][] families, string? firstKey)
+        {
+            var shown = families
+                .Select(family => family
+                    .Select(name => itemsByInternalName.TryGetValue(name, out Entry e) ? e : (Entry?)null)
+                    .Where(e => e != null).Select(e => e!.Value)
+                    .GroupBy(e => e.Key).Select(g => g.First())   // Egg and Brown Egg are both "Egg": once
+                    .ToList())
+                .Where(family => family.Count > 0)
+                .ToList();
+
+            if (firstKey != null)
+            {
+                int index = shown.FindIndex(family => family.Any(e => e.Key == firstKey));
+                if (index > 0)
+                {
+                    var family = shown[index];
+                    shown.RemoveAt(index);
+                    shown.Insert(0, family);
+                }
+                if (shown.Count > 0)
+                {
+                    int inner = shown[0].FindIndex(e => e.Key == firstKey);
+                    if (inner > 0)
+                    {
+                        Entry first = shown[0][inner];
+                        shown[0].RemoveAt(inner);
+                        shown[0].Insert(0, first);
+                    }
+                }
+            }
+
+            var texts = new List<string>();
+            foreach (Entry e in shown.SelectMany(family => family))
+            {
+                if (!texts.Contains(e.Text, StringComparer.OrdinalIgnoreCase))
+                    texts.Add(e.Text);
+            }
+            return texts;
+        }
+
+        /// <summary>"Corn", "Corn and Sunflower", "Corn, Sunflower and Sunflower Seeds".</summary>
+        private static string JoinNames(List<string> names)
+        {
+            if (names.Count <= 1)
+                return names.FirstOrDefault() ?? "";
+            return string.Join(", ", names.Take(names.Count - 1)) + " and " + names[^1];
+        }
+
+        /// <summary>The product word typed (last word, any spelling) -> the machine the player used.</summary>
+        private static readonly Dictionary<string, string> SuffixMachine = new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["wine"] = Keg,
+            ["wines"] = Keg,
+            ["juice"] = Keg,
+            ["juices"] = Keg,
+            ["jelly"] = Jar,
+            ["jellies"] = Jar,
+            ["pickle"] = Jar,
+            ["pickles"] = Jar,
+            ["honey"] = BeeHouse,
+            ["roe"] = Pond,
+            ["roes"] = Pond,
+            ["bait"] = BaitMaker,
+            ["baits"] = BaitMaker,
+            ["oil"] = OilMaker,
+            ["flour"] = Mill,
+            ["sugar"] = Mill,
+            ["cheese"] = CheesePress,
+            ["cheeses"] = CheesePress,
+            ["mayonnaise"] = MayoMachine,
+            ["mayo"] = MayoMachine,
+            ["cloth"] = Loom
+        };
+
+        /// <summary>The first word typed ("pickled corn", "dried corn", "smoked apple") -> the machine.</summary>
+        private static readonly Dictionary<string, string> PrefixMachine = new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["pickled"] = Jar,
+            ["dried"] = Dehydrator,
+            ["smoked"] = Smoker
+        };
+
+        /// <summary>The ingredient categories, and their "made from" words per product, in the order most made first (same as BuiltOutputs).</summary>
+        private static readonly (int Id, string Word)[] IngredientCategories =
+        {
+            (-79, "fruit"), (-75, "vegetable"), (-81, "forage"), (-80, "flower"), (-4, "fish")
+        };
+        private static readonly (string Word, string Machine)[] CategoryProducts =
+        {
+            ("roe", Pond), ("wine", Keg), ("pickles", Jar), ("jelly", Jar), ("juice", Keg), ("bait", BaitMaker), ("honey", BeeHouse)
+        };
+
+        /// <summary>
+        /// The two lines for a text (no commas, quality words already out) that names a product the game never makes, or null when the text is
+        /// fine (see IMPOSSIBLE PRODUCTS).
+        /// </summary>
+        public ImpossibleProduct? GetImpossibleProduct(string text)
+        {
+            try
+            {
+                string plain = (text ?? "").Trim();
+                string key = MakeKey(plain);
+                if (key.Length == 0 || knownWordKeys.Contains(key) || ownedKeys.Contains(key) || TryResolveName(plain, out _, out _))
+                    return null;   // a name the game (or a chest) knows, in any spelling, or an alias: searched as always
+
+                string[] words = plain.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+                if (words.Length < 2)
+                    return null;
+
+                // the machine the player used, and the words of the ingredient
+                string machine;
+                string ingredientText;
+                string? productWord = null;   // the typed product word, for "corn, jelly" (only the "X wine" forms)
+                if (words.Length >= 3 && string.Equals(words[0], "aged", StringComparison.OrdinalIgnoreCase) && words[^1].StartsWith("roe", StringComparison.OrdinalIgnoreCase))
+                {
+                    machine = Jar;
+                    ingredientText = string.Join(" ", words, 1, words.Length - 2);
+                }
+                else if (SuffixMachine.TryGetValue(words[^1], out string? suffixMachine))
+                {
+                    machine = suffixMachine;
+                    ingredientText = string.Join(" ", words, 0, words.Length - 1);
+                    productWord = words[^1];
+                }
+                else if (PrefixMachine.TryGetValue(words[0], out string? prefixMachine))
+                {
+                    machine = prefixMachine;
+                    ingredientText = string.Join(" ", words, 1, words.Length - 1);
+                }
+                else
+                {
+                    return null;
+                }
+
+                string ingredientKey = MakeKey(ingredientText);
+                if (ingredientKey.Length == 0)
+                    return null;
+
+                var outputs = new List<(string Name, string Machine, bool Direct, float Rank, string HowMade)>();
+                string subject;
+                bool plural;
+
+                if (ModEntry.IsCategoryWord(ingredientText))
+                {
+                    // a category ("fruit juice"): only the ingredient categories; their products are the "made from" words ("fruit wine")
+                    if (ModEntry.TryGetMadeFrom(plain, out _, out _, out _))
+                        return null;   // "fruit wine": a real category
+                    HashSet<int> ids = ModEntry.GetStaticCategoryIds(ingredientText);
+                    int found = Array.FindIndex(IngredientCategories, c => ids.Contains(c.Id));
+                    if (found < 0)
+                        return null;   // "egg jelly", "milk wine": two categories, as always
+
+                    string word = IngredientCategories[found].Word;
+                    for (int i = 0; i < CategoryProducts.Length; i++)
+                    {
+                        string made = word + " " + CategoryProducts[i].Word;
+                        if (ModEntry.TryGetMadeFrom(made, out _, out _, out _))
+                            outputs.Add((made, CategoryProducts[i].Machine, true, i, ""));
+                    }
+                    subject = Capitalize(ingredientText.Trim().ToLowerInvariant());
+                    plural = subject.EndsWith("s", StringComparison.OrdinalIgnoreCase) || string.Equals(word, "fish", StringComparison.Ordinal);
+                    for (int i = 0; i < outputs.Count; i++)   // "Fruit becomes fruit wine in a Keg."
+                    {
+                        var cur = outputs[i];
+                        outputs[i] = (cur.Name, cur.Machine, cur.Direct, cur.Rank, HowMade(subject, plural, cur.Name, cur.Machine));
+                    }
+                }
+                else
+                {
+                    // an item ("corn jelly", "carp wine")
+                    if (!realItemsByKey.TryGetValue(ingredientKey, out Entry ingredient) || ingredient.ItemId == null)
+                    {
+                        // another singular / plural spelling of the ingredient ("cranberry wine" -> Cranberries)
+                        string? other = FindItemKeyVariant(ingredientText);
+                        if (other == null || !realItemsByKey.TryGetValue(other, out ingredient) || ingredient.ItemId == null)
+                            return null;   // not an item ("xyz wine")
+                    }
+
+                    // the built names of the ingredient, with their machines
+                    foreach (Entry entry in vocabulary)
+                    {
+                        if (!entry.Built || entry.ItemId == null || !string.Equals(entry.RankId, ingredient.ItemId, StringComparison.Ordinal))
+                            continue;
+                        int index = Array.FindIndex(BuiltOutputs, o => o.BaseId == entry.ItemId);
+                        if (index >= 0)
+                            outputs.Add((entry.Text, BuiltOutputs[index].Machine, BuiltOutputs[index].Direct, index, ""));
+                    }
+
+                    // the items of their own a machine makes of it (Beer, Pale Ale, Caviar, Squid Ink, Mayonnaise ...)
+                    subject = ingredient.Text;
+                    plural = IsPluralName(subject);
+
+                    foreach (var special in SpecialOutputs)
+                    {
+                        if (!special.Families.SelectMany(f => f).Any(name => itemsByInternalName.TryGetValue(name, out Entry e) && e.Key == ingredient.Key))
+                            continue;
+                        string output = itemsByInternalName.TryGetValue(special.Output, out Entry o) ? o.Text : special.Output;
+                        if (outputs.Any(x => string.Equals(x.Name, output, StringComparison.OrdinalIgnoreCase)))
+                            continue;
+
+                        // who makes it: this ingredient first, its family next ("Corn, Sunflower and Sunflower Seeds make Oil in an Oil Maker.")
+                        List<string> makers = IngredientList(special.Families, ingredient.Key);
+                        string makersText = makers.Count > 0 ? JoinNames(makers) : subject;
+                        bool makersPlural = makers.Count > 1 || IsPluralName(makersText);
+                        outputs.Add((output, special.Machine, special.Direct, special.Rank, HowMade(makersText, makersPlural, output, special.Machine)));
+                    }
+
+                    for (int i = 0; i < outputs.Count; i++)   // a built name: "Corn becomes Corn Juice in a Keg."
+                    {
+                        var cur = outputs[i];
+                        if (cur.HowMade.Length == 0)
+                            outputs[i] = (cur.Name, cur.Machine, cur.Direct, cur.Rank, HowMade(subject, plural, cur.Name, cur.Machine));
+                    }
+                }
+
+                if (outputs.Count == 0)
+                    return null;   // it becomes nothing ("wood wine"): searched as two words, as always
+
+                var ordered = outputs.OrderBy(o => o.Rank).ToList();
+                // A: what the machine the player used makes of it; B: what is made of it most ("usually", it is a suggestion, not the answer)
+                var lead = ordered.FirstOrDefault(o => o.Direct && o.Machine == machine);
+                bool usually = lead.Name == null;
+                if (usually)
+                    lead = ordered[0];
+
+                var result = new ImpossibleProduct
+                {
+                    Subject = subject,
+                    Link = lead.Name,
+                    Missing = TitleCase(plain),
+                    SubjectTip = $"There's no {TitleCase(plain)} in the game."
+                };
+                (result.Middle, result.Tail) = Sentence(lead.Machine, plural, usually);
+                foreach (var output in ordered)
+                {
+                    result.Sources[output.Name] = output.HowMade;
+                    if (!string.Equals(output.Name, lead.Name, StringComparison.OrdinalIgnoreCase))
+                        result.Alternatives.Add(output.Name);
+                }
+
+                if (productWord != null)
+                {
+                    result.SplitFirst = ingredientText.Trim();
+                    result.SplitSecond = productWord;
+                    result.Split = result.SplitFirst + ", " + result.SplitSecond;
+                }
+                return result;
+            }
+            catch (Exception)
+            {
+                return null;   // no lines rather than a crash: the text is handled as before
+            }
+        }
+
+        /// <summary>" becomes " / " in a Keg." (" makes " ... " in a Fish Pond." / " near a Bee House."), " usually becomes " for case B.</summary>
+        private static (string Middle, string Tail) Sentence(string machine, bool plural, bool usually = false)
+        {
+            string lead = usually ? " usually " : " ";
+            if (machine == Pond)
+                return (lead + (plural ? "make " : "makes "), " in a Fish Pond.");
+            if (machine == BeeHouse)
+                return (lead + (plural ? "make " : "makes "), " near a Bee House.");
+            return (lead + (plural ? "become " : "becomes "), $" in {Article(machine)} {machine}.");
+        }
+
+        /// <summary>The whole sentence of a product, for its tip: "Corn becomes Corn Juice in a Keg."</summary>
+        private static string HowMade(string makers, bool plural, string output, string machine)
+        {
+            var (middle, tail) = Sentence(machine, plural);
+            return makers + middle + output + tail;
+        }
+
+        /// <summary>"Hops", "Tea Leaves", "Cranberries" take a plural verb ("become"); "Glass" does not.</summary>
+        private static bool IsPluralName(string name) =>
+            name.EndsWith("s", StringComparison.OrdinalIgnoreCase) && !name.EndsWith("ss", StringComparison.OrdinalIgnoreCase);
+
+        private static string Article(string word) => word.Length > 0 && "AEIOUaeiou".IndexOf(word[0]) >= 0 ? "an" : "a";
+
+        private static string Capitalize(string text) => text.Length == 0 ? text : char.ToUpperInvariant(text[0]) + text.Substring(1);
+
+        private static string TitleCase(string text) => CultureInfo.InvariantCulture.TextInfo.ToTitleCase((text ?? "").Trim().ToLowerInvariant());
+
+        // ===================== ALIASES AND OTHER SPELLINGS =====================
+        // ALIASES: things the game has under a name of its own, typed the way people say them. They are searched as that item (no refusal):
+        // the drop-down shows the game's name with the typed words dimmed after it ("Raisins (dried grape)"), the result title and the history
+        // use the game's name, and the tip of the title word starts with a note ("Dried grapes are called Raisins in the game.").
+        // OTHER SPELLINGS: a name of several words typed with another singular / plural form of a word ("cranberry jelly" = Cranberries Jelly,
+        // "pickled hop" = Pickled Hops) is that name. Case and singular / plural never matter, in aliases either.
+
+        // A note that names several makers ("{0} all make plain Oil in the game.") lists them with IngredientList: the family of the typed one
+        // first and the typed one first in it ("sunflower oil": Sunflower, Sunflower Seeds and Corn). Lead: the internal name of the typed maker.
+        private static readonly (string Target, (string Phrase, string Lead)[] Phrases, string Output, string Template)[] FamilyAliases =
+        {
+            ("Oil", new[] { ("corn oil", "Corn"), ("sunflower oil", "Sunflower"), ("sunflower seed oil", "Sunflower Seeds"), ("sunflower seeds oil", "Sunflower Seeds") },
+                "Oil", "{0} all make plain Oil in the game."),
+            ("Mayonnaise", new[] { ("egg mayonnaise", "Egg"), ("brown egg mayonnaise", "Egg"), ("chicken egg mayonnaise", "Egg"), ("large egg mayonnaise", "Large Egg") },
+                "Mayonnaise", "{0} all make plain Mayonnaise in the game."),
+            ("Cheese", new[] { ("milk cheese", "Milk"), ("cow milk cheese", "Milk"), ("large milk cheese", "Large Milk") },
+                "Cheese", "{0} both make plain Cheese in the game."),
+            ("Goat Cheese", new[] { ("goat milk cheese", "Goat Milk"), ("large goat milk cheese", "L. Goat Milk") },
+                "Goat Cheese", "{0} both make Goat Cheese in the game.")
+        };
+
+        private static readonly (string Target, string[] Phrases, string Note)[] Aliases =
+        {
+            ("Raisins", new[] { "dried grape", "raisin" }, "Dried grapes are called Raisins in the game."),
+            ("Caviar", new[] { "aged sturgeon roe", "sturgeon caviar" }, "Aged Sturgeon Roe is called Caviar in the game."),
+            ("Mead", new[] { "honey wine" }, "Honey wine is called Mead in the game."),
+            ("Pale Ale", new[] { "hops beer", "hop beer" }, "Beer made from Hops is called Pale Ale in the game."),
+            ("Beer", new[] { "wheat beer" }, "Beer made from Wheat is simply called Beer in the game."),
+            ("Vinegar", new[] { "rice vinegar" }, "Vinegar is made from Rice in the game."),
+            ("Sugar", new[] { "beet sugar" }, "Sugar is made from Beets in the game."),
+            ("Mayonnaise", new[] { "golden egg mayonnaise" }, "Golden Eggs become regular Mayonnaise (always gold quality)."),
+            ("Mayonnaise", new[] { "ostrich egg mayonnaise" }, "Ostrich Eggs become regular Mayonnaise (10 at a time)."),
+            ("Duck Mayonnaise", new[] { "duck egg mayonnaise" }, "Duck Eggs make Duck Mayonnaise in the game."),
+            ("Void Mayonnaise", new[] { "void egg mayonnaise" }, "Void Eggs make Void Mayonnaise in the game."),
+            ("Dinosaur Mayonnaise", new[] { "dinosaur egg mayonnaise" }, "Dinosaur Eggs make Dinosaur Mayonnaise in the game."),
+        };
+
+        /// <summary>Alias key (every singular / plural spelling) -> (internal name of the item, note). Built with the word list.</summary>
+        private Dictionary<string, (string Target, string Note)> aliasByKey = new(StringComparer.Ordinal);
+
+        /// <summary>Key -> shown name of every item name of the word list and of the chests (not the category words), for OTHER SPELLINGS.</summary>
+        private Dictionary<string, string> itemTextByKey = new(StringComparer.Ordinal);
+        private Dictionary<string, string> ownedTextByKey = new(StringComparer.Ordinal);   // the same for the names only the chests know (other mods)
+
+        /// <summary>The shown name of an item key (word list first, then the chests), or null.</summary>
+        private string? ItemTextOf(string key) =>
+            itemTextByKey.TryGetValue(key, out string? text) ? text : ownedTextByKey.TryGetValue(key, out string? owned) ? owned : null;
+
+        private void BuildAliases()
+        {
+            var map = new Dictionary<string, (string Target, string Note)>(StringComparer.Ordinal);
+            foreach (var alias in Aliases)
+            {
+                foreach (string phrase in alias.Phrases)
+                {
+                    foreach (string variant in SpellingVariants(phrase))
+                        map.TryAdd(MakeKey(variant), (alias.Target, alias.Note));
+                }
+            }
+
+            // the notes that name several makers: worked out per typed maker (its family first, see IngredientList)
+            foreach (var alias in FamilyAliases)
+            {
+                var special = SpecialOutputs.FirstOrDefault(o => o.Output == alias.Output);
+                if (special.Families == null)
+                    continue;
+                foreach (var (phrase, lead) in alias.Phrases)
+                {
+                    string? leadKey = itemsByInternalName.TryGetValue(lead, out Entry leadEntry) ? leadEntry.Key : null;
+                    List<string> makers = IngredientList(special.Families, leadKey);
+                    if (makers.Count == 0)
+                        continue;
+                    string template = makers.Count == 2 ? alias.Template.Replace(" all ", " both ") : makers.Count > 2 ? alias.Template.Replace(" both ", " all ") : alias.Template;
+                    string note = makers.Count == 1 ? $"{makers[0]} makes {alias.Output} in the game." : string.Format(template, JoinNames(makers));
+                    foreach (string variant in SpellingVariants(phrase))
+                        map.TryAdd(MakeKey(variant), (alias.Target, note));
+                }
+            }
+            aliasByKey = map;
+        }
+
+        /// <summary>
+        /// True if the text is an alias ("dried grapes") or another singular / plural spelling of a name of several words ("cranberry jelly"):
+        /// <paramref name="name"/> is the game's name to search, <paramref name="note"/> the note of an alias (null for another spelling).
+        /// False for a name that is already right, and for anything else.
+        /// </summary>
+        public bool TryResolveName(string text, out string name, out string? note)
+        {
+            name = "";
+            note = null;
+            string plain = (text ?? "").Trim();
+            string key = MakeKey(plain);
+            if (key.Length == 0)
+                return false;
+
+            if (aliasByKey.TryGetValue(key, out var alias))
+            {
+                if (itemsByInternalName.TryGetValue(alias.Target, out Entry target))
+                {
+                    name = target.Text;
+                    note = alias.Note;
+                    return true;
+                }
+                return false;   // the item is not in this game (a mod removed it): nothing to resolve
+            }
+
+            if (knownWordKeys.Contains(key) || ownedKeys.Contains(key))
+                return false;   // already a name as it is
+
+            string? variantKey = FindItemKeyVariant(plain, minWords: 2);
+            string? shown = variantKey == null ? null : ItemTextOf(variantKey);
+            if (shown == null)
+                return false;
+            name = shown;
+            return true;
+        }
+
+        /// <summary>The key of an item name that is the text in another singular / plural spelling of its words, or null (the text's own key excluded).</summary>
+        private string? FindItemKeyVariant(string text, int minWords = 1)
+        {
+            string[] words = (text ?? "").Trim().Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+            if (words.Length < minWords || words.Length > 4)
+                return null;
+            string ownKey = MakeKey(text ?? "");
+            foreach (string variant in SpellingVariants(string.Join(" ", words)))
+            {
+                string key = MakeKey(variant);
+                if (key != ownKey && ItemTextOf(key) != null)
+                    return key;
+            }
+            return null;
+        }
+
+        /// <summary>Every spelling of a phrase with each word in its singular or plural form ("dried grape" -> dried grapes, dried grape ...).</summary>
+        private static IEnumerable<string> SpellingVariants(string phrase)
+        {
+            string[] words = (phrase ?? "").Trim().ToLowerInvariant().Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+            IEnumerable<string> result = new[] { "" };
+            foreach (string word in words)
+            {
+                string[] forms = WordForms(word).ToArray();
+                result = result.SelectMany(start => forms.Select(form => start.Length == 0 ? form : start + " " + form)).ToList();
+            }
+            return result;
+        }
+
+        /// <summary>A word and its singular / plural forms ("berry" / "berries", "leaf" / "leaves", "hop" / "hops").</summary>
+        private static IEnumerable<string> WordForms(string word)
+        {
+            var forms = new HashSet<string>(StringComparer.Ordinal) { word };
+            if (word.Length < 3)
+                return forms;
+            forms.Add(word + "s");
+            forms.Add(word + "es");
+            if (word.EndsWith("ies", StringComparison.Ordinal))
+                forms.Add(word.Substring(0, word.Length - 3) + "y");
+            if (word.EndsWith("y", StringComparison.Ordinal))
+                forms.Add(word.Substring(0, word.Length - 1) + "ies");
+            if (word.EndsWith("ves", StringComparison.Ordinal))
+                forms.Add(word.Substring(0, word.Length - 3) + "f");
+            if (word.EndsWith("f", StringComparison.Ordinal))
+                forms.Add(word.Substring(0, word.Length - 1) + "ves");
+            if (word.EndsWith("es", StringComparison.Ordinal))
+                forms.Add(word.Substring(0, word.Length - 2));
+            if (word.EndsWith("s", StringComparison.Ordinal) && !word.EndsWith("ss", StringComparison.Ordinal))
+                forms.Add(word.Substring(0, word.Length - 1));
+            return forms;
+        }
 
         /// <summary>Fishing products (1.6) that are Fish-type items but are not fish: no roe, no smoked version.</summary>
         private static readonly HashSet<string> NotRealFishIds = new(StringComparer.OrdinalIgnoreCase) { "SeaJelly", "RiverJelly", "CaveJelly" };
@@ -649,7 +1216,9 @@ namespace ChestItemFinder
         {
             bool english = LocalizedContentManager.CurrentLanguageCode == LocalizedContentManager.LanguageCode.en;
 
-            // baseId = the plain product the name belongs to ("Peach Wine" -> (O)348), so the hover tip can show its category (Artisan Goods)
+            // baseId = the plain product the name belongs to ("Peach Wine" -> (O)348), so the hover tip can show its category (Artisan Goods);
+            // ingredientId = what it is made of ("Peach Wine" -> Peach): every list ranks it like its ingredient
+            string ingredientId = "";
             void Add(string text, string baseId)
             {
                 if (!IsUsableName(text))
@@ -657,7 +1226,7 @@ namespace ChestItemFinder
 
                 string key = MakeKey(text);
                 if (key.Length > 0 && !byKey.ContainsKey(key))
-                    byKey[key] = new Entry(text, key, baseId, built: true);
+                    byKey[key] = new Entry(text, key, baseId, built: true, rankId: ingredientId);
             }
 
             foreach (KeyValuePair<string, ObjectData> pair in Game1.objectData)
@@ -674,6 +1243,7 @@ namespace ChestItemFinder
                     continue;
                 string name = shown;
 
+                ingredientId = "(O)" + id;
                 List<string> tags = data.ContextTags ?? new List<string>();
                 int category = data.Category;
                 bool isFruit = category == -79;
@@ -685,7 +1255,8 @@ namespace ChestItemFinder
                     Add(name + " Wine", "(O)348");
                 if (isFruit || tags.Contains("preserves_jelly"))
                     Add(name + " Jelly", "(O)344");
-                if (isVegetable || tags.Contains("keg_juice"))
+                // Wheat, Hops and Tea Leaves are vegetables, but a keg makes Beer, Pale Ale and Green Tea of them, never a juice
+                if ((isVegetable || tags.Contains("keg_juice")) && !KegSpecialIngredients.Contains(data.Name ?? ""))
                     Add(name + " Juice", "(O)350");
                 if (isVegetable || tags.Contains("preserves_pickle"))
                     Add("Pickled " + name, "(O)342");
@@ -706,8 +1277,15 @@ namespace ChestItemFinder
                     Add(name + " Bait", "(O)SpecificBait");
                 }
 
-                if (isFish && !tags.Contains("fish_legendary") && !tags.Contains("fish_legendary_family"))
-                    Add("Smoked " + name, "(O)SmokedFish");
+                if (isFish)
+                    Add("Smoked " + name, "(O)SmokedFish");   // every fish, legendary ones included ("Smoked Legend")
+
+                // the Sea Urchin is no fish, but it lives in a fish pond and makes roe
+                if (string.Equals(data.Name, "Sea Urchin", StringComparison.OrdinalIgnoreCase))
+                {
+                    Add(name + " Roe", "(O)812");
+                    Add("Aged " + name + " Roe", "(O)447");
+                }
             }
         }
 
@@ -1072,31 +1650,130 @@ namespace ChestItemFinder
 
         /// <summary>
         /// True if any name the game has (every item that can lie in a chest, the names the game builds on the fly like "Peach Wine", the category
-        /// words) or any name in the chests right now contains the text, anywhere (spaces, hyphens, underscores and case ignored).
-        /// Used to tell a word that exists in the game but is in no chest ("an empty result") from a word nothing in the world matches ("Invalid").
+        /// words) or any name in the chests right now contains the text, WORD-ALIGNED (see WORD-ALIGNED MATCHING; case, spaces, hyphens and
+        /// underscores ignored). Used to tell a word that exists in the game but is in no chest ("an empty result") from a word nothing in the world
+        /// matches ("Invalid", which gets "Did you mean").
         /// </summary>
-        public bool AnyNameContains(string rawText)
+        /// <param name="rawText">The text to look for (a plural / singular spelling of what was typed is fine).</param>
+        /// <param name="typedText">What the player typed, with its spaces (null = the same as <paramref name="rawText"/>).</param>
+        public bool AnyNameContains(string rawText, string? typedText = null)
         {
             string key = MakeKey(rawText ?? "");
             if (key.Length == 0)
                 return false;
+            List<string> words = VariantWordKeys(typedText ?? rawText ?? "", key);
 
             foreach (Entry entry in vocabulary)
             {
-                if (entry.Key.Contains(key, StringComparison.Ordinal))
+                if (MatchesAligned(entry.Key, entry.WordStarts, words))
                     return true;
             }
 
             foreach (Entry entry in ownedEntries)
             {
-                if (entry.Key.Contains(key, StringComparison.Ordinal))
+                if (MatchesAligned(entry.Key, entry.WordStarts, words))
                     return true;
             }
 
             foreach (Entry entry in unholdableEntries)
             {
-                if (entry.Key.Contains(key, StringComparison.Ordinal))
+                if (MatchesAligned(entry.Key, entry.WordStarts, words))
                     return true;   // Weeds, Twig ...: they exist in the game (an empty result), they are not "Invalid"
+            }
+
+            return false;
+        }
+
+        // ===================== WORD-ALIGNED MATCHING =====================
+        // Spaces are ignored when a name is matched ("star fruit" finds Starfruit, "hotpepper" finds Hot Pepper), but a match may not START in the
+        // middle of a word and then run on into the next one: "sshirt" is not a part of "Flames Shirt" (flame-S SHIRT), it is a typo of "shirt" and
+        // gets "Did you mean: Shirt". A match counts when
+        //   - it lies inside one word of the name ("fis" in Catfish, "nfish" in Lionfish), or
+        //   - it starts where a word of the name starts ("starfruit" in "Star Fruit", "pepperwine" in "Hot Pepper Wine"), or
+        //   - the player typed several words and every space they typed falls on a word border of the name: the first typed word may be the end of a
+        //     word, the last one the start of a word ("fruit wine" in "Starfruit Wine", "ancient fr" in "Ancient Fruit").
+        // Used by the search (ModEntry.NameContains), by "does this word exist" (AnyNameContains) and by the "Showing results for:" lists (GetTipNames),
+        // so all three always agree. The drop-down only offers names a word of which starts with the text, so it never needed this.
+
+        /// <summary>The keys of the words the player typed ("Fruit  Wine" -> fruit, wine).</summary>
+        public static List<string> TypedWordKeys(string rawText)
+        {
+            return (rawText ?? "").Split(new[] { ' ', '\t', '_', '-', '\u3000' }, StringSplitOptions.RemoveEmptyEntries)
+                .Select(MakeKey)
+                .Where(word => word.Length > 0)
+                .ToList();
+        }
+
+        /// <summary>
+        /// The typed words for one spelling of the text (a plural / singular spelling only changes the end of the last word): "fruit wines" with the
+        /// spelling "fruitwine" -> fruit, wine. A spelling that does not fit the typed words is one word.
+        /// </summary>
+        public static List<string> VariantWordKeys(string typedText, string variantKey)
+        {
+            List<string> words = TypedWordKeys(typedText);
+            if (words.Count == 0)
+                return new List<string> { variantKey };
+            if (string.Concat(words) == variantKey)
+                return words;
+
+            string front = string.Concat(words.Take(words.Count - 1));
+            if (words.Count > 1 && variantKey.Length > front.Length && variantKey.StartsWith(front, StringComparison.Ordinal))
+            {
+                var result = words.Take(words.Count - 1).ToList();
+                result.Add(variantKey.Substring(front.Length));
+                return result;
+            }
+
+            return new List<string> { variantKey };
+        }
+
+        /// <summary>True if the name holds the typed words, word-aligned (see WORD-ALIGNED MATCHING).</summary>
+        public static bool NameMatchesAligned(string? name, IReadOnlyList<string> typedWords)
+        {
+            if (string.IsNullOrEmpty(name))
+                return false;
+            return MatchesAligned(MakeKey(name), FindWordStarts(name), typedWords);
+        }
+
+        private static bool MatchesAligned(string key, int[] starts, IReadOnlyList<string> typedWords)
+        {
+            if (typedWords.Count == 0)
+                return false;
+            string text = typedWords.Count == 1 ? typedWords[0] : string.Concat(typedWords);
+            if (text.Length == 0)
+                return false;
+
+            int from = 0;
+            while (from <= key.Length - text.Length)
+            {
+                int position = key.IndexOf(text, from, StringComparison.Ordinal);
+                if (position < 0)
+                    return false;
+                from = position + 1;
+
+                // inside one word
+                int word = Array.FindLastIndex(starts, start => start <= position);
+                int wordEnd = word >= 0 && word + 1 < starts.Length ? starts[word + 1] : key.Length;
+                if (position + text.Length <= wordEnd)
+                    return true;
+
+                // from the start of a word on
+                if (Array.IndexOf(starts, position) >= 0)
+                    return true;
+
+                // several typed words: every typed space on a word border of the name
+                if (typedWords.Count > 1)
+                {
+                    bool aligned = true;
+                    int border = position;
+                    for (int w = 0; w < typedWords.Count - 1 && aligned; w++)
+                    {
+                        border += typedWords[w].Length;
+                        aligned = Array.IndexOf(starts, border) >= 0;
+                    }
+                    if (aligned)
+                        return true;
+                }
             }
 
             return false;
@@ -1174,12 +1851,66 @@ namespace ChestItemFinder
 
             ownedEntries = byKey.Values.ToArray();
             ownedKeys = new HashSet<string>(byKey.Keys);
+            ownedTextByKey = byKey.ToDictionary(pair => pair.Key, pair => pair.Value.Text, StringComparer.Ordinal);
             popularCache.Clear();   // the category lists also hold items that only the chests know (other mods' items)
             ownedCounts = byKey.Keys.ToDictionary(key => key, _ => 1);   // without counts every owned name counts as 1 (SetOwnedItems sets the real numbers)
         }
 
         /// <summary>The best <paramref name="max"/> names that start with what the player typed (empty list if nothing fits).</summary>
+        /// <summary>
+        /// Hidden second spellings of a category word: typed whole, the drop-down shows what the real word shows ("clothes" -> clothing (category) and
+        /// every piece of clothing), followed by the other names the typed word starts (Clothesline). The hidden spelling itself is never shown.
+        /// </summary>
+        private static readonly Dictionary<string, string> HiddenCategoryAliases = new(StringComparer.Ordinal) { ["clothes"] = "clothing" };
+
         public IReadOnlyList<Suggestion> Search(string rawQuery, int max)
+        {
+            // an alias ("dried grape" -> Raisins, with the typed words dimmed after it) or another spelling ("cranberry jelly" -> Cranberries Jelly):
+            // that name is the first row (see ALIASES AND OTHER SPELLINGS), then whatever the text itself finds
+            if (TryResolveName(rawQuery ?? "", out string resolved, out string? aliasNote))
+            {
+                var rows = new List<Suggestion>();
+                string resolvedKey = MakeKey(resolved);
+                Entry? known = null;
+                foreach (Entry e in vocabulary)
+                {
+                    if (e.Key == resolvedKey && e.ItemId != null)
+                    {
+                        known = e;
+                        break;
+                    }
+                }
+                if (known is Entry k)
+                    rows.Add(new Suggestion(k.Text, 0, qualifiedId: k.ItemId, ingredientId: k.Built ? k.RankId : null,
+                        aliasText: aliasNote != null ? (rawQuery ?? "").Trim().ToLowerInvariant() : null, aliasNote: aliasNote));
+                else
+                    rows.Add(new Suggestion(resolved, 0));
+                foreach (Suggestion row in SearchTyped(rawQuery ?? "", max))
+                {
+                    if (rows.Count >= max)
+                        break;
+                    if (MakeKey(row.Text) != resolvedKey)
+                        rows.Add(row);
+                }
+                return rows;
+            }
+
+            if (HiddenCategoryAliases.TryGetValue(MakeKey(rawQuery ?? ""), out string? realWord))
+            {
+                var combined = new List<Suggestion>(SearchTyped(realWord, max));
+                var seen = new HashSet<string>(combined.Select(row => MakeKey(row.Text)), StringComparer.Ordinal);
+                foreach (Suggestion row in SearchTyped(rawQuery ?? "", max))
+                {
+                    if (!row.IsCategory && seen.Add(MakeKey(row.Text)))
+                        combined.Add(row);
+                }
+                return combined;
+            }
+
+            return SearchTyped(rawQuery ?? "", max);
+        }
+
+        private IReadOnlyList<Suggestion> SearchTyped(string rawQuery, int max)
         {
             // a number ("26", "-7") completes to the ids that start with it, each with its name; text is completed as before
             // (a lone "-" lists the category ids, the ones closest to zero first: -2, -4, -5 ... -79 ...; the player types on, "-7", to narrow it down)
@@ -1216,24 +1947,21 @@ namespace ChestItemFinder
 
             hits.Sort(CompareHits);
 
-            // the slot plan (see THE GLOBAL SLOT RULE): slot 1 stays the best match (the exact name, which ModEntry.GetKnownNameCheck relies on);
-            // slots 2 and 3 are taken from the items that match in the same, best way (start of the name before a later word), so a far-fetched
-            // match never jumps ahead of a good one
-            int bestItemRank = int.MaxValue;
-            foreach (Hit hit in hits)
-            {
-                if (!hit.IsCategory && !hit.Exact && hit.Rank < bestItemRank)
-                    bestItemRank = hit.Rank;
-            }
+            // THE SAME ORDER AS THE "Showing results for:" TIP (GetTipNames): the drop-down lists the names the tip lists, in the tip's order (items of
+            // one root together, "Hot Pepper", "Hot Pepper Wine", "Dried Hot Pepper" ...; the most used root first; clothing, furniture, dishes last),
+            // only without the names the drop-down does not offer (the typed text must start the name or one of its words). On top: the exact name
+            // first (ModEntry.GetKnownNameCheck relies on it), then the category words, as before. ("Did you mean" keeps its own slot rule.)
+            var tipIndex = new Dictionary<string, int>(StringComparer.Ordinal);
+            IReadOnlyList<string> tipNames = GetTipNames(new[] { query }, null, rawQuery);
+            for (int t = 0; t < tipNames.Count; t++)
+                tipIndex.TryAdd(MakeKey(tipNames[t]), t);
 
-            Dictionary<string, int> core = CoreRanks;
-            List<int> order = ApplySlotPlan(
-                hits.Count,
-                max,
-                coreEligible: i => !hits[i].IsCategory && !hits[i].Exact && hits[i].Rank == bestItemRank && (hits[i].Demote == 0 || core.ContainsKey(hits[i].Entry.Key)),
-                coreScore: i => CoreScore(hits[i].Entry, hits[i].Usage),
-                ownedCount: i => hits[i].IsCategory || hits[i].Rank != bestItemRank ? 0 : hits[i].OwnedCount,
-                nearDuplicate: (a, b) => IsNearDuplicate(hits[a].Entry, hits[a].IsCategory, hits[b].Entry, hits[b].IsCategory, query));
+            List<int> order = Enumerable.Range(0, hits.Count)
+                .OrderBy(i => hits[i].Exact ? 0 : hits[i].IsCategory ? 1 : 2)
+                .ThenBy(i => hits[i].Exact || hits[i].IsCategory ? 0 : tipIndex.TryGetValue(hits[i].Entry.Key, out int at) ? at : int.MaxValue)
+                .ThenBy(i => i)   // the old match order (CompareHits) for everything else
+                .Take(max)
+                .ToList();
 
             // the typed text IS a quality word ("gold", "iridium"): the tools of that material come right after the exact / category rows
             // (Gold Pickaxe, Gold Axe, Gold Watering Can ...), see QUALITY WORDS AND TOOLS
@@ -1250,7 +1978,8 @@ namespace ChestItemFinder
             {
                 // the typed text is dimmed only when it is the start of the whole name; a match inside a later word ("Fishing Jelly") is drawn in full color
                 int matched = hits[i].Rank == 0 ? MatchedLength(hits[i].Entry.Text, query.Length) : 0;
-                result.Add(new Suggestion(hits[i].Entry.Text, matched, hits[i].IsCategory, qualifiedId: hits[i].Entry.ItemId));
+                result.Add(new Suggestion(hits[i].Entry.Text, matched, hits[i].IsCategory, qualifiedId: hits[i].Entry.ItemId,
+                    ingredientId: hits[i].Entry.Built ? hits[i].Entry.RankId : null));
             }
 
             // AUTO SUGGEST ONLY (never used by "Did you mean", see FindSimilar): the player has typed a WHOLE category word ("artisan goods", "fish",
@@ -1312,9 +2041,68 @@ namespace ChestItemFinder
             ("dried fruit", "(O)DriedFruit"), ("dried mushrooms", "(O)DriedMushrooms"), ("smoked fish", "(O)SmokedFish"), ("targeted bait", "(O)SpecificBait")
         };
 
+        private Dictionary<string, int>? popularPlaces;
+        private Dictionary<string, int>? popularPlacesById;
+        private object? popularBuiltFor;
+
+        /// <summary>
+        /// The place of an item in the favourite list of its OWN category (PopularByCategory: Starfruit 0, Ancient Fruit 1 ... in the fruit list),
+        /// int.MaxValue for an item no favourite list names. Used to rank a built name like its ingredient.
+        /// </summary>
+        private int PopularPlaceOf(string key)
+        {
+            if (popularPlaces == null || !ReferenceEquals(popularBuiltFor, itemsByInternalName))
+            {
+                popularBuiltFor = itemsByInternalName;
+                popularPlacesById = null;
+                popularPlaces = new Dictionary<string, int>(StringComparer.Ordinal);
+                foreach (var (_, names) in PopularByCategory)
+                {
+                    for (int i = 0; i < names.Length; i++)
+                    {
+                        if (itemsByInternalName.TryGetValue(names[i], out Entry entry))
+                            popularPlaces.TryAdd(entry.Key, i);
+                        popularPlaces.TryAdd(MakeKey(names[i]), i);
+                    }
+                }
+            }
+            return popularPlaces.TryGetValue(key, out int place) ? place : int.MaxValue;
+        }
+
+        /// <summary>PopularPlaceOf for a qualified item id.</summary>
+        private int PopularPlaceOfId(string? qualifiedId)
+        {
+            if (qualifiedId == null)
+                return int.MaxValue;
+            PopularPlaceOf("");   // (re)builds the lists if needed
+            if (popularPlacesById == null)
+            {
+                popularPlacesById = new Dictionary<string, int>(StringComparer.Ordinal);
+                foreach (Entry entry in realItemsByKey.Values)
+                {
+                    if (entry.ItemId != null)
+                        popularPlacesById.TryAdd(entry.ItemId, PopularPlaceOf(entry.Key));
+                }
+            }
+            return popularPlacesById.TryGetValue(qualifiedId, out int place) ? place : int.MaxValue;
+        }
+
+        /// <summary>
+        /// The real item whose name IS a category word too ("Egg", "Milk", "Honey", "Bait"), or null. Typed alone, the word means the category; the
+        /// drop-down offers the item itself right under the category row as "Egg (item)", which searches only that item (ModEntry, ITEM LABEL).
+        /// </summary>
+        public Suggestion? GetSameNameItemRow(string categoryWord)
+        {
+            if (!realItemsByKey.TryGetValue(MakeKey(categoryWord ?? ""), out Entry item) || item.ItemId == null || item.Unholdable || IsCheatOnlyObject(item.ItemId))
+                return null;
+            string text = item.Text + " (item)";
+            return new Suggestion(text, 0, qualifiedId: item.ItemId);
+        }
+
         /// <summary>
         /// The finished drop-down for a whole category word, or null when the text is not one (then the normal list is used). Row 1 is the
-        /// category, then every item of the category (cached per category), then the other rows of <paramref name="normalRows"/> in their order.
+        /// category, then the item of the same name if there is one ("Egg (item)"), then every item of the category (cached per category), then
+        /// the other rows of <paramref name="normalRows"/> in their order.
         /// </summary>
         private List<Suggestion>? ExpandCategory(string typed, List<Suggestion> normalRows, int max)
         {
@@ -1357,6 +2145,13 @@ namespace ChestItemFinder
             var result = new List<Suggestion>(Math.Min(max, members.Count + normalRows.Count + 1)) { categoryRow };
             var listed = new HashSet<string>(StringComparer.Ordinal) { MakeKey(categoryRow.Text) };
 
+            // the item that has the category's name ("Egg"): right under the category, as "Egg (item)"
+            if (GetSameNameItemRow(plain) is Suggestion itemRow && result.Count < max)
+            {
+                result.Add(itemRow);
+                listed.Add(MakeKey(itemRow.Text));
+            }
+
             foreach (Suggestion member in members)
             {
                 if (result.Count >= max)
@@ -1377,6 +2172,28 @@ namespace ChestItemFinder
             return result;
         }
 
+        /// <summary>
+        /// True if the entry belongs to an "ingredient category + product" word ("fruit wine"): a name the game builds from that product whose
+        /// ingredient is of one of the categories ("Apple Wine": Apple is a fruit). A name only the chests know (an item of another mod, its
+        /// ingredient unknown here) counts when the product can only be made of those categories at all (every wine is a fruit wine).
+        /// </summary>
+        private static bool IsMadeFromMember(Entry entry, string[] productIds, int[] ingredientCategories, bool coversEveryIngredient)
+        {
+            if (entry.ItemId == null || Array.IndexOf(productIds, entry.ItemId) < 0)
+                return false;
+            if (!entry.Built)
+                return coversEveryIngredient;   // a held item of that product, ingredient unknown (the plain cheat-only product never gets here)
+            try
+            {
+                ParsedItemData? ingredient = ItemRegistry.GetData(entry.RankId);   // RankId of a built name = its ingredient
+                return ingredient != null && !ingredient.IsErrorItem && Array.IndexOf(ingredientCategories, ingredient.Category) >= 0;
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+
         /// <summary>Every item of a category, in the order described above (see CATEGORY EXPANSION). Empty if the category has no items the library knows.</summary>
         private List<Suggestion> BuildCategoryMembers(string categoryWord)
         {
@@ -1395,8 +2212,17 @@ namespace ChestItemFinder
                 }
             }
 
-            HashSet<int> ids = flavoredBase == null ? ModEntry.GetStaticCategoryIds(categoryWord) : new HashSet<int>();
-            if (flavoredBase == null && ids.Count == 0)
+            // "ingredient category + product" ("fruit wine", "vegetable juice", "fish roe", see ModEntry MADE FROM): it is a category, so it lists
+            // every product made from that kind of ingredient, exactly what the search finds ("fruit wine" -> Starfruit Wine, Apple Wine ...),
+            // not only the names that happen to hold the words "fruit wine" (Ancient Fruit Wine)
+            string[] madeProductIds = Array.Empty<string>();
+            int[] madeIngredientCategories = Array.Empty<int>();
+            bool madeCoversAll = false;
+            bool madeFrom = flavoredBase == null
+                && ModEntry.TryGetMadeFrom(categoryWord, out madeProductIds, out madeIngredientCategories, out madeCoversAll);
+
+            HashSet<int> ids = flavoredBase == null && !madeFrom ? ModEntry.GetStaticCategoryIds(categoryWord) : new HashSet<int>();
+            if (flavoredBase == null && !madeFrom && ids.Count == 0)
                 return rows;
 
             var categoryCache = new Dictionary<string, bool>(StringComparer.Ordinal);
@@ -1406,6 +2232,8 @@ namespace ChestItemFinder
                     return false;
                 if (flavoredBase != null)
                     return string.Equals(entry.ItemId, flavoredBase, StringComparison.Ordinal);
+                if (madeFrom)
+                    return IsMadeFromMember(entry, madeProductIds, madeIngredientCategories, madeCoversAll);
 
                 if (categoryCache.TryGetValue(entry.ItemId, out bool cached))
                     return cached;
@@ -1453,22 +2281,20 @@ namespace ChestItemFinder
             (int Late, int Curated, long Core, int Built, int BaseProgress, int Length, string Text) RankOf(Entry entry)
             {
                 Entry rankEntry = entry;
-                (int Tier, int Progress) usage = ItemRanking.Get(entry.ItemId);
-                int baseProgress = 0;
+                (int Tier, int Progress) usage = ItemRanking.Get(entry.RankId);
+                int curatedPlace = curated.TryGetValue(entry.Key, out int p) ? p : int.MaxValue;
                 if (entry.Built)
                 {
-                    // "Starfruit Wine" is ranked by Starfruit (the tier stays the one of the product, so it sits with the other artisan goods)
-                    baseProgress = usage.Progress;
+                    // "Starfruit Wine" is ranked EXACTLY like Starfruit in the fruit list: the same favourite place (PopularByCategory of the
+                    // ingredient's own category), the same core rank, the same tier and progress. So "wine" lists its wines in the order "fruit"
+                    // lists its fruit (Qi Fruit Wine last, like Qi Fruit)
                     if (realItemsByKey.TryGetValue(MakeKey(GuessRoot(entry.Text)), out Entry ingredient))
-                    {
                         rankEntry = ingredient;
-                        usage = (usage.Tier, ItemRanking.Get(ingredient.ItemId).Progress);
-                    }
+                    curatedPlace = PopularPlaceOf(rankEntry.Key);
                 }
 
-                int late = DemoteLevel(rankEntry.ItemId) == 1 || DemoteLevel(entry.ItemId) == 1 ? 1 : 0;
-                int curatedPlace = !entry.Built && curated.TryGetValue(entry.Key, out int p) ? p : int.MaxValue;
-                return (late, curatedPlace, CoreScore(rankEntry, usage), entry.Built ? 1 : 0, baseProgress, entry.Key.Length, entry.Text);
+                int late = DemoteLevel(entry.RankId) == 1 ? 1 : 0;
+                return (late, curatedPlace, CoreScore(rankEntry, usage), 0, 0, entry.Key.Length, entry.Text);
             }
 
             foreach (Entry entry in members.Values
@@ -1482,7 +2308,7 @@ namespace ChestItemFinder
                 .ThenBy(x => x.Rank.Text, StringComparer.CurrentCultureIgnoreCase)
                 .Select(x => x.Member))
             {
-                rows.Add(new Suggestion(entry.Text, 0, qualifiedId: entry.ItemId, viaCategory: via));
+                rows.Add(new Suggestion(entry.Text, 0, qualifiedId: entry.ItemId, viaCategory: via, ingredientId: entry.Built ? entry.RankId : null));
             }
 
             return rows;
@@ -1722,9 +2548,9 @@ namespace ChestItemFinder
                 // Cooking, Cookout Kit): a perfect match, before every spelling guess. Category words count too (they are the broadest meaning).
                 if (symbolsStripped && !wholeNameOnly && !ownTypo && query.Length >= 3 && key.Length > query.Length && key.StartsWith(query, StringComparison.Ordinal))
                 {
-                    int startDemote = isCategory ? 0 : DemoteLevel(entry.ItemId);
+                    int startDemote = isCategory ? 0 : DemoteLevel(entry.RankId);
                     candidates.Add(new SpellingCandidate(entry, isCategory, 0, 0, startDemote, key.Length - query.Length,
-                        isCategory ? (0, 0) : ItemRanking.Get(entry.ItemId), ownedCounts.GetValueOrDefault(key)));
+                        isCategory ? (0, 0) : ItemRanking.Get(entry.RankId), ownedCounts.GetValueOrDefault(key)));
                     return;
                 }
 
@@ -1848,8 +2674,8 @@ namespace ChestItemFinder
                     kind = 3;
                 }
 
-                int demote = isCategory || ownTypo ? 0 : DemoteLevel(entry.ItemId);
-                (int Tier, int Progress) usage = isCategory ? (0, 0) : ItemRanking.Get(entry.ItemId);
+                int demote = isCategory || ownTypo ? 0 : DemoteLevel(entry.RankId);
+                (int Tier, int Progress) usage = isCategory ? (0, 0) : ItemRanking.Get(entry.RankId);
                 candidates.Add(new SpellingCandidate(entry, isCategory, score, kind, demote, Math.Abs(key.Length - query.Length), usage, ownedCounts.GetValueOrDefault(key)));
             }
 
@@ -1893,9 +2719,9 @@ namespace ChestItemFinder
                     if (!familyKeys.Add(member.Key))
                         continue;
 
-                    int demote = DemoteLevel(member.ItemId);
+                    int demote = DemoteLevel(member.RankId);
                     var variant = new SpellingCandidate(member, false, anchor.Score, 1, demote, Math.Abs(member.Key.Length - query.Length),
-                        ItemRanking.Get(member.ItemId), ownedCounts.GetValueOrDefault(member.Key));
+                        ItemRanking.Get(member.RankId), ownedCounts.GetValueOrDefault(member.Key));
 
                     if (indexByKey.TryGetValue(member.Key, out int at))
                     {
@@ -2284,6 +3110,7 @@ namespace ChestItemFinder
             public string Text = "";
             public string Key = "";
             public string? Id;          // the item's own qualified id (for a built name: the id of its base product)
+            public string? RankId;      // the id it is ranked by (for a built name: its ingredient)
             public bool Built;
             public int Rank;            // 0 = starts with the text, 1 = a later word starts with it, 2 = contains it
             public string RootKey = "";
@@ -2296,23 +3123,27 @@ namespace ChestItemFinder
         /// the search matched). Category words are not returned (the caller lists categories itself, first).
         /// </summary>
         /// <param name="typedKeys">The typed text as keys (spaces / hyphens removed, lower case) in their singular / plural spellings; the first one is the text as typed.</param>
-        public IReadOnlyList<string> GetTipNames(IReadOnlyList<string> typedKeys, IEnumerable<(string Name, string? QualifiedId)>? extra = null)
+        public IReadOnlyList<string> GetTipNames(IReadOnlyList<string> typedKeys, IEnumerable<(string Name, string? QualifiedId)>? extra = null, string? typedText = null)
         {
             if (typedKeys == null || typedKeys.Count == 0 || typedKeys[0].Length == 0)
                 return Array.Empty<string>();
 
+            // the typed words of every spelling, for the word-aligned check (see WORD-ALIGNED MATCHING)
+            var wordsOf = typedKeys.Distinct().ToDictionary(v => v, v => VariantWordKeys(typedText ?? v, v));
+
             var byKey = new Dictionary<string, TipCandidate>();
 
-            void Consider(string text, string? id, bool built)
+            void Consider(string text, string? id, bool built, string? rankId = null)
             {
                 string key = MakeKey(text ?? "");
                 if (key.Length == 0 || byKey.ContainsKey(key))
                     return;
 
                 int rank = -1;
+                int[] textStarts = FindWordStarts(text ?? "");
                 foreach (string variant in typedKeys)
                 {
-                    if (variant.Length == 0 || !key.Contains(variant, StringComparison.Ordinal))
+                    if (variant.Length == 0 || !key.Contains(variant, StringComparison.Ordinal) || !MatchesAligned(key, textStarts, wordsOf[variant]))
                         continue;
 
                     int r = key.StartsWith(variant, StringComparison.Ordinal) ? 0
@@ -2332,6 +3163,7 @@ namespace ChestItemFinder
                     Text = text!,
                     Key = key,
                     Id = id,
+                    RankId = rankId ?? id,
                     Built = built,
                     Rank = rank,
                     RootKey = rootKey.Length > 0 ? rootKey : key,
@@ -2340,9 +3172,9 @@ namespace ChestItemFinder
             }
 
             foreach (Entry entry in ownedEntries)
-                Consider(entry.Text, entry.ItemId, entry.Built);
+                Consider(entry.Text, entry.ItemId, entry.Built, entry.RankId);
             foreach (Entry entry in vocabulary)
-                Consider(entry.Text, entry.ItemId, entry.Built);
+                Consider(entry.Text, entry.ItemId, entry.Built, entry.RankId);
             // items that cannot be carried (Weeds, Twig ...) are never listed in a tip
             if (extra != null)
             {
@@ -2366,9 +3198,12 @@ namespace ChestItemFinder
                 string? rootId = rootMember?.Id;
                 if (rootId == null && realItemsByKey.TryGetValue(g.Key, out Entry rootEntry))
                     rootId = rootEntry.ItemId;
+                rootId ??= members.FirstOrDefault(m => m.Built)?.RankId;   // only built names: their ingredient is the root
                 (int Tier, int Progress) lead = rootId != null
                     ? ItemRanking.Get(rootId)
-                    : members.Select(m => ItemRanking.Get(m.Built ? null : m.Id)).OrderBy(r => r.Tier).ThenBy(r => r.Progress).First();
+                    : members.Select(m => ItemRanking.Get(m.RankId)).OrderBy(r => r.Tier).ThenBy(r => r.Progress).First();
+                int demote = rootId != null ? DemoteLevel(rootId) : members.Min(m => DemoteLevel(m.RankId));
+                int popular = PopularPlaceOfId(rootId);
 
                 var ordered = members
                     .OrderBy(m => m.IsRoot ? 0 : m.Built ? 1 : 2)
@@ -2378,13 +3213,15 @@ namespace ChestItemFinder
                     .ThenBy(m => m.Text, StringComparer.CurrentCultureIgnoreCase)
                     .ToList();
 
-                return (Lead: lead, Rank: members.Min(m => m.Rank), Name: (rootMember ?? ordered[0]).Text, Members: ordered);
+                return (Lead: lead, Demote: demote, Popular: popular, Rank: members.Min(m => m.Rank), Name: (rootMember ?? ordered[0]).Text, Members: ordered);
             });
 
-            // 2. order the groups
+            // 2. order the groups: normal before late-game (Qi Fruit ...) before furniture / clothing / dishes; then by the root's tier, its favourite
+            //    place and its progress (the same order as the root's own category list: the wines follow the fruit)
             List<TipCandidate> orderedCandidates = groups
-                .OrderBy(g => g.Lead.Tier >= ItemRanking.FirstDemotedTier ? 1 : 0)
+                .OrderBy(g => g.Demote)
                 .ThenBy(g => g.Lead.Tier)
+                .ThenBy(g => g.Popular)
                 .ThenBy(g => g.Lead.Progress)
                 .ThenBy(g => g.Rank)
                 .ThenBy(g => g.Name.Length)
@@ -2517,13 +3354,18 @@ namespace ChestItemFinder
     /// How useful / central an item is to a player, for ordering suggestions (the "Showing results for:" tip and "Did you mean"). Display only:
     /// it never changes what the search finds. Two numbers, both "smaller = shown earlier":
     ///   Tier      what kind of thing it is, by how much a player uses that kind:
-    ///               1 crops, fruit, vegetables, forage and mushrooms, flowers, fish, gems and minerals, ores, bars, coal, wood, stone, animal products,
-    ///                 seeds, monster loot (the everyday resources)
-    ///               2 artisan goods and other processed things (Wine, Jelly, Juice, Cheese, Mayonnaise, Honey, Roe, syrups, ingredients)
-    ///               3 tools, weapons, machines and other big craftables, crafted items, bait, tackle, fertilizer, rings, boots, trinkets, books, artifacts
-    ///               4 cooked dishes                                              } "demoted": the suggestions put these last unless
+    ///               1 the core of the game, all equal: tools; crops (fruit, vegetables); flowers; animal products; artisan goods and the tapper
+    ///                 products (Oak Resin, Maple Syrup, Pine Tar); fish and Roe / Squid Ink; gems and minerals; ores, bars, coal, wood, stone, clay,
+    ///                 fiber; seeds; monster loot; Torch, Hay, Moss, the geodes; the seven core machines (Keg, Preserves Jar, Cask, Mayonnaise Machine,
+    ///                 Cheese Press, Fish Smoker, Crystalarium)
+    ///               2 everything else a player uses now and then: forage (also the foraged fruit the game files as fruit: Salmonberry, Blackberry,
+    ///                 Wild Plum, Spice Berry, Crystal Fruit, Coconut, Cactus Fruit, and Fiddlehead Fern), beach finds (Clam, Coral ...), seaweed,
+    ///                 every other machine and big craftable, weapons, rings, boots, trinkets, bait, tackle, fertilizer, crafted items, cooking
+    ///                 ingredients, books, artifacts, and the items without a category (slime eggs, totems, fossils ...)
+    ///               3 (not used)
+    ///               4 cooked dishes (and Field Snack, Bug Steak)                 } "demoted": the suggestions put these last unless
     ///               5 decoration: paths, floors, fences, gates; trash           } nothing else matches as well
-    ///               6 furniture, hats, clothing                                  }
+    ///               6 furniture, hats, clothing, wallpaper, flooring, mannequins }
     ///   Progress  0 .. 100: when a player meets it and how much they use it, inside its tier. Early, everyday items first (Crystal Fruit,
     ///             Salmonberry), core late-game items in the middle (Starfruit, Ancient Fruit), late, mostly-for-fun items at the end (Qi Fruit).
     ///             Well-known items have a fixed value (looked up by the game's internal English name, so it works in every language); any other
@@ -2545,9 +3387,29 @@ namespace ChestItemFinder
         private static readonly Dictionary<string, (int Tier, int Progress)> cache = new();
         private static object? cacheBuiltFor;
 
-        private static readonly HashSet<int> TierOneCategories = new() { -79, -75, -81, -80, -4, -2, -12, -15, -16, -5, -6, -18, -14, -17, -74, -28 };
-        private static readonly HashSet<int> TierTwoCategories = new() { -26, -27, -23, -25 };
-        private static readonly HashSet<int> TierThreeCategories = new() { -8, -9, -19, -21, -22, -29, -96, -97, -98, -99, -101, -102, -103 };
+        /// <summary>Tier 1: crops, flowers, fish, gems / minerals, ores / bars, wood / stone, animal products, seeds, monster loot, artisan goods, tapper products, tools.</summary>
+        private static readonly HashSet<int> TierOneCategories = new() { -79, -75, -80, -4, -2, -12, -15, -16, -5, -6, -18, -14, -17, -74, -28, -26, -27, -99 };
+
+        /// <summary>Tier 1 by name (the game's internal English name): items of a tier 2 category or without one that are core all the same.</summary>
+        private static readonly HashSet<string> TierOneNames = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "Roe", "Squid Ink", "Torch", "Spirit Torch", "Hay", "Moss", "Geode", "Frozen Geode", "Magma Geode", "Omni Geode", "Artifact Trove"
+        };
+
+        /// <summary>The seven core machines (big craftables, internal names without spaces): tier 1. Every other machine is tier 2.</summary>
+        private static readonly HashSet<string> TierOneMachines = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "Keg", "PreservesJar", "Cask", "MayonnaiseMachine", "CheesePress", "FishSmoker", "Crystalarium"
+        };
+
+        /// <summary>Foraged fruit and greens the game files under fruit / vegetables: low value, rarely looked for, so tier 2 like the rest of the forage.</summary>
+        private static readonly HashSet<string> ForagedCropNames = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "Salmonberry", "Blackberry", "Wild Plum", "Spice Berry", "Crystal Fruit", "Coconut", "Cactus Fruit", "Fiddlehead Fern"
+        };
+
+        /// <summary>Snacks without the cooking category: ranked like cooked dishes (tier 4).</summary>
+        private static readonly HashSet<string> SnackNames = new(StringComparer.OrdinalIgnoreCase) { "Field Snack", "Bug Steak" };
 
         /// <summary>Name endings of decoration crafts (paths, floors, fences ...): tier 5, even though the game files them under "crafting".</summary>
         private static readonly string[] DecorNameEndings = { "Path", "Floor", "Flooring", "Fence", "Gate", "Brazier", "Stepping Stone", "Walkway" };
@@ -2618,27 +3480,34 @@ namespace ChestItemFinder
             string type = data.ItemType?.Identifier ?? "";
             int category = data.Category;
 
-            if (type == "(F)" || type == "(H)" || type == "(S)" || type == "(P)" || category == -95 || category == -100 || (category == -24 && type != "(O)"))
+            if (type == "(F)" || type == "(H)" || type == "(S)" || type == "(P)" || type == "(M)" || type == "(WP)" || type == "(FL)"
+                || category == -95 || category == -100 || (category == -24 && type != "(O)"))
                 return 6;
-            if (type == "(T)" || type == "(W)" || type == "(B)" || type == "(TR)" || type == "(BC)")
-                return 3;
 
             string name = data.InternalName ?? "";
+            if (type == "(T)")
+                return 1;   // tools
+            if (type == "(BC)")
+                return TierOneMachines.Contains(name.Replace(" ", "")) ? 1 : 2;   // the core machines first, every other big craftable after them
+            if (type == "(W)" || type == "(B)" || type == "(TR)")
+                return 2;   // weapons, boots, trinkets
+
+            if (TierOneNames.Contains(name))
+                return 1;
+            if (ForagedCropNames.Contains(name))
+                return 2;
+            if (SnackNames.Contains(name))
+                return 4;
+
             if (DecorNameEndings.Any(ending => name.EndsWith(ending, StringComparison.OrdinalIgnoreCase)) || category == -24 || category == -20 || category == -999)
                 return 5;
 
             if (TierOneCategories.Contains(category))
                 return 1;
-            if (TierTwoCategories.Contains(category))
-                return 2;
-            if (TierThreeCategories.Contains(category))
-                return 3;
             if (category == -7)
                 return 4;
-            if (string.Equals(data.ObjectType, "Arch", StringComparison.OrdinalIgnoreCase))
-                return 3;   // artifacts
 
-            return 4;
+            return 2;   // forage, beach finds, rings, bait, tackle, fertilizer, crafted items, ingredients, books, artifacts, items without a category ...
         }
 
         private static int GetProgress(ParsedItemData data)

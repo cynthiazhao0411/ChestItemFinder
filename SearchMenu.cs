@@ -70,9 +70,6 @@ namespace ChestItemFinder
         private const string QualityOnlyHintText = "Add an item to the quality, e.g. 'gold star apple'.";
         private const string QualityConflictHintText = "Please use only one quality, e.g. 'gold star apple'.";
 
-        /// <summary>The hint for the impossible query "vegetable jelly" (jelly is made from fruit; vegetables become pickles). The search is not run.</summary>
-        private const string VegetableJellyHintText = ModEntry.VegetableJellyHint;
-
         /// <summary>
         /// Punctuation a search may contain besides letters, digits, spaces and (in any script) letters with accents:
         /// straight and curly apostrophe ("Farmer's Lunch"), hyphen (negative category ids like "-26", and "Auto-Grabber"),
@@ -105,9 +102,10 @@ namespace ChestItemFinder
         private static readonly string[] QualityLabels = { "Any quality", "Silver star", "Gold star", "Iridium star", "No quality" };
 
         /// <summary>
-        /// The star filter the player picked last, remembered for the rest of this game session so the next search box opens with it
-        /// (a position in <see cref="QualityValues"/>, not a quality value: 0 = "Any quality"). Static and in memory only: it is not saved
-        /// to config.json, so after restarting the game the filter is back to "Any quality".
+        /// The star filter of the last search that really ran (Enter, and the result page opened), remembered for the rest of this game session so
+        /// the next search box opens with it (a position in <see cref="QualityValues"/>, not a quality value: 0 = "Any quality"). A star that was
+        /// only clicked (or set by a history word) and then left without a search is NOT kept: the next box opens with the last searched one.
+        /// Static and in memory only: it is not saved to config.json, so after restarting the game the filter is back to "Any quality".
         /// </summary>
         private static int lastQualityIndex = 0;
 
@@ -365,6 +363,17 @@ namespace ChestItemFinder
         // This is the text that stays in front of it when a suggestion is picked: "fruit, " for "fruit, fi". Empty = the whole text is completed.
         private string suggestionPrefix = "";
         private static readonly char[] SpaceChars = { ' ', '\t' };
+
+        // SEVERAL CATEGORIES ("fish fruit egg", see RefreshSuggestions): the category words in the order typed (at most three), the number of
+        // category rows at the top of the drop-down, and the quality words in front of them. Null = the drop-down completes one word as usual.
+        private List<string>? multiCategoryTerms;
+        private int multiCategoryRowCount;
+        private string multiCategoryLead = "";
+
+        // the big white note above the box when a fourth word is typed ("Only 3 at a time ..."): its text, and which ignored words it was
+        // shown for (the same words are not announced twice in a row). It has no fade: it is there or gone (see UpdateCategoryNote)
+        private string? categoryNoteText;
+        private string? categoryNoteKey;
         private bool magnifierPressStarted;   // the left button went down on the magnifier and is (possibly) still held
 
         // Instant correction ("Did you mean: Fish, Catfish" under the text box, before Enter): filled by RefreshSuggestions only when the word being typed
@@ -375,6 +384,37 @@ namespace ChestItemFinder
 
         // hover tips of the history words (asked from ModEntry once per word and remembered while this menu is open)
         private readonly Func<string, string?>? getWordTip;
+
+        // ===================== STAR BUTTON OF AN ITEM WITHOUT QUALITY =====================
+        // While a star is chosen and the text only names items that never have quality ("bridal shirt", also when picked from the history), the
+        // star button keeps the star the player chose (it is the player's setting, used again as soon as the text names an item with quality),
+        // and its hover tip adds one line: "Bridal Shirt has no quality, so this won't filter it." (several items: "These items have no quality,
+        // so this won't filter them."). Only the result panel switches to the outline star (it shows what the search really did).
+        // The answer is worked out once per text (when the text changes), not every frame.
+        private readonly Func<string, string?>? textHasNoQuality;
+        private string? noQualityCheckedText;
+        private string? noQualityCached;
+
+        /// <summary>The extra line of the star tip, or null when the star applies (see STAR BUTTON OF AN ITEM WITHOUT QUALITY).</summary>
+        private string? NoQualityStarLine
+        {
+            get
+            {
+                if (textHasNoQuality == null || EffectiveQuality == -1)
+                    return null;   // "Any quality" filters nothing anyway: nothing to add
+                string text = textBox.Text ?? "";
+                if (text != noQualityCheckedText)
+                {
+                    noQualityCheckedText = text;
+                    noQualityCached = text.Trim().Length > 0 ? textHasNoQuality(text) : null;
+                }
+                if (noQualityCached == null)
+                    return null;
+                return noQualityCached.Length > 0
+                    ? $"{noQualityCached} has no quality, so this won't filter it."
+                    : "These items have no quality, so this won't filter them.";
+            }
+        }
         private readonly Dictionary<string, string?> wordTipCache = new();
 
         // hover tip of the drop-down: set while the list is drawn (DrawSuggestions), drawn last (DrawSuggestionTip) so it lies on top
@@ -401,10 +441,12 @@ namespace ChestItemFinder
         /// <param name="getSuggestions">Returns the auto-complete suggestions for the text typed so far. Null = no drop-down at all.</param>
         /// <param name="autoSearchText">Optional: a text that is put into the search box and searched at once (no Enter needed), like a player typing it and pressing Enter. Used when a "Did you mean" word of the result panel is clicked. Null = the box opens empty.</param>
         /// <param name="autoSearchQuality">The star filter of that automatic search (-1 = any, 1 = silver, 2 = gold, 4 = iridium, 0 = no star). Only used together with <paramref name="autoSearchText"/>.</param>
+        /// <param name="textHasNoQuality">Says whether a search text only names items that never have quality (ModEntry.TextRefersOnlyToNoQualityItems): returns the item's name ("" for several items, null when the star applies); the hover tip of the star button then adds "Bridal Shirt has no quality, so this won't filter it." Null = no such line.</param>
         /// <param name="getSpelling">Returns the names spelled like a typed word that nothing in the game matches (ModEntry.GetInstantSpelling), for the "Did you mean" line under the text box while the player is still typing. Null = no such line.</param>
         /// <param name="getWordTip">Returns the hover tip of one word of the search history (null = no tip), see ModEntry.GetTermTip (the same tip rules everywhere: history, drop-down, result panel). Null = no tips in the history.</param>
         public SearchMenu(Func<string, int, SearchReport> onConfirm, List<SearchHistoryEntry> history, Action onHistoryChanged, string? leakedChar = null, Func<string, IReadOnlyList<Suggestion>>? getSuggestions = null,
-            string? autoSearchText = null, int autoSearchQuality = -1, Func<string, string?>? getWordTip = null, Func<string, IReadOnlyList<string>>? getSpelling = null)
+            string? autoSearchText = null, int autoSearchQuality = -1, Func<string, string?>? getWordTip = null, Func<string, IReadOnlyList<string>>? getSpelling = null,
+            Func<string, string?>? textHasNoQuality = null)
             : base(
                 Game1.uiViewport.Width / 2 - DialogWidth / 2,
                 Game1.uiViewport.Height / 2 - (MenuHeight + ExtraHeightFor(history)) / 2,
@@ -420,6 +462,7 @@ namespace ChestItemFinder
             this.getSuggestions = getSuggestions;
             this.getWordTip = getWordTip;
             this.getSpelling = getSpelling;
+            this.textHasNoQuality = textHasNoQuality;
             this.qualityIndex = Math.Clamp(lastQualityIndex, 0, QualityValues.Length - 1);   // reopen with the star the player used last
 
             // the star button sits at the right end of the search row; the text box is shortened to make room
@@ -529,6 +572,38 @@ namespace ChestItemFinder
             return rest;
         }
 
+        /// <summary>
+        /// The words the star button writes into the text when the text already names a quality: "silver star", "gold star", "iridium star",
+        /// "no star"; "any quality" writes nothing. (The hover tips keep their own labels, "No quality" / "Any quality".) "iridium" alone would not
+        /// do: on its own it is an item word (Iridium Ore), so the button always writes "... star".
+        /// </summary>
+        private static string QualityWords(int quality)
+        {
+            return quality switch
+            {
+                1 => "silver star",
+                2 => "gold star",
+                4 => "iridium star",
+                0 => "no star",
+                _ => ""
+            };
+        }
+
+        /// <summary>
+        /// The text with its quality words replaced by those of <paramref name="quality"/>, where the first ones stood ("apple gold star" ->
+        /// "apple iridium star"); any further quality words are dropped. For "any quality" the quality words are simply taken out.
+        /// </summary>
+        private static string RewriteQualityWords(string text, int quality)
+        {
+            string words = QualityWords(quality);
+            if (words.Length == 0)
+                return ExtractQuality(text, out _, out _, out _);   // any quality: the text without its quality words (separators tidied up)
+
+            int seen = 0;
+            string rewritten = QualityPhraseRegex.Replace(text, _ => seen++ == 0 ? words : "");
+            return Regex.Replace(rewritten, @"\s{2,}", " ").Trim();
+        }
+
         /// <summary>The star filter really used: the quality typed into the text, or else the star button.</summary>
         private int EffectiveQuality => typedQuality ?? QualityValues[qualityIndex];
 
@@ -553,7 +628,27 @@ namespace ChestItemFinder
         /// </summary>
         internal static bool IsTermSearchable(string term)
         {
+            term = WithoutNameBrackets(term);
             return IsQueryValid(term) && !IsSymbolsOnly(term) && !HasInvalidCharacters(term);
+        }
+
+        /// <summary>
+        /// The term with its brackets turned into spaces when it is the whole name of an item that has brackets of its own ("Crop Tank Top (F)",
+        /// see ModEntry.IsBracketItemName), for the checks only: those brackets are part of the name, not a mistake. Any other text comes back as it is.
+        /// </summary>
+        private static string WithoutNameBrackets(string term)
+        {
+            if (ModEntry.TryStripItemLabel(term, out string labeledItem))
+                return labeledItem;   // "Egg (item)": the label is legal (see ModEntry, ITEM LABEL); the name is checked like any other
+            if (term.IndexOfAny(BracketChars) < 0 || !ModEntry.IsBracketItemName(term))
+                return term;
+            var chars = term.ToCharArray();
+            for (int i = 0; i < chars.Length; i++)
+            {
+                if (Array.IndexOf(BracketChars, chars[i]) >= 0)
+                    chars[i] = ' ';
+            }
+            return new string(chars);
         }
 
         /// <summary>
@@ -900,7 +995,8 @@ namespace ChestItemFinder
             bool hasCommas = ModEntry.HasCommas(query);
             string plainQuery = ModEntry.NormalizeQueryText(query);
             List<string> terms = hasCommas ? ModEntry.GetCommaTerms(query) : new List<string> { plainQuery };
-            string checkedText = string.Join(" ", terms);   // all terms together, for the checks that only look for a bad character
+            // a term that is the whole name of an item with brackets of its own ("Crop Tank Top (F)") is checked without them: its brackets are legal
+            string checkedText = string.Join(" ", terms.Select(WithoutNameBrackets));   // all terms together, for the checks that only look for a bad character
 
             // every word of the query, split at the commas AND at the spaces (the legal " (category)" label is already gone)
             List<string> words = checkedText.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).ToList();
@@ -969,9 +1065,20 @@ namespace ChestItemFinder
                     : null;
             }
 
-            // "vegetable jelly" can never exist in the game: refuse it with an explanation instead of searching the two words separately
-            if (refusal == null && !hasCommas && ModEntry.IsVegetableJellyQuery(plainQuery))
-                refusal = VegetableJellyHintText;
+            // a product the game never makes ("corn jelly", "carp wine", "fruit juice", see IMPOSSIBLE PRODUCT LINES): refused like the other
+            // refusals (same sound, nothing searched, nothing remembered), but its two lines stay, the first one in red
+            if (refusal == null && !hasCommas && ModEntry.GetImpossibleProduct(plainQuery) != null)
+            {
+                Game1.playSound(RefusedSound);
+                showTooShortHint = false;
+                showNoQualityHint = false;
+                lastText = textBox.Text;
+                SuppressSuggestions();
+                impossibleRefused = true;   // after SuppressSuggestions: it works the lines out again and would reset it
+                textBox.Selected = true;
+                Game1.keyboardDispatcher.Subscriber = textBox;
+                return;
+            }
 
             if (refusal != null)
             {
@@ -1024,6 +1131,7 @@ namespace ChestItemFinder
             if (historyTerms.Count > 0)
                 RecordHistory(historyTerms, searchQuality);   // the history keeps the plain words with the quality ("apple" + gold): clicking it sets the star button
 
+            lastQualityIndex = qualityIndex;   // the search ran (the result page opens): its star is kept for the next search box
             exitThisMenu();
         }
 
@@ -1105,12 +1213,7 @@ namespace ChestItemFinder
             // do not call base: it would close the menu when typing letters like "E"
             if (key == Keys.Escape)
             {
-                if (copyBubble.IsOpen)
-                {
-                    copyBubble.Close();   // Esc first closes the "Copy" bubble, a second Esc the search box
-                    return;
-                }
-                exitThisMenu();
+                CancelLikeEsc();
                 return;
             }
 
@@ -1325,7 +1428,7 @@ namespace ChestItemFinder
             // the red X in the top right corner: same as pressing Esc (the drop-down, if it covers the X, has already swallowed the click above)
             if (CloseButtonVisible && CloseButtonBounds.Contains(x, y))
             {
-                exitThisMenu();
+                CloseByX();
                 return;
             }
 
@@ -1445,8 +1548,11 @@ namespace ChestItemFinder
                         textBox.Text = chip.Word;
                         SearchHistoryEntry? picked = history.Find(h => string.Equals(h.Word, chip.Word, StringComparison.OrdinalIgnoreCase));
                         qualityIndex = picked == null ? 0 : Math.Max(Array.IndexOf(QualityValues, picked.Quality), 0);
-                        lastQualityIndex = qualityIndex;   // same as clicking the star button: the next search box opens with it
-                        SuppressSuggestions();   // the player picked a finished search: no drop-down on top of it
+
+                        // exactly as if the word had been typed (without Enter): the drop-down shows what typing it would show ("fruit" -> fruit
+                        // (category), Starfruit, ...; "frui" too), and a misspelled word gets its "Did you mean" line, as before
+                        suppressedText = null;
+                        RefreshSuggestions();
                         showTooShortHint = false;
                         showNoQualityHint = false;
                         Game1.playSound("smallSelect");
@@ -1458,9 +1564,22 @@ namespace ChestItemFinder
             if (starButton.Contains(x, y))
             {
                 // outline star (any) -> silver -> gold -> iridium -> empty frame (no quality) -> outline star ...
-                qualityIndex = (qualityIndex + 1) % QualityValues.Length;
-                lastQualityIndex = qualityIndex;   // remember it for the next time the search box opens
-                showNoQualityHint = false;
+                if (typedQuality is int typed)
+                {
+                    // the quality is written in the text ("gold star apple"): the button goes on from THAT quality and rewrites the words in place,
+                    // in the same instant: "gold star apple" -> "iridium star apple" -> "no star apple" -> "apple" (any quality) -> ...
+                    int next = (Math.Max(Array.IndexOf(QualityValues, typed), 0) + 1) % QualityValues.Length;
+                    textBox.Text = RewriteQualityWords(textBox.Text, QualityValues[next]);
+                    qualityIndex = next;
+                    RefreshSuggestions();   // works out typedQuality (and the drop-down) for the new text right away
+                }
+                else
+                {
+                    // the quality is only on the button: only the button changes (no words are added to the text)
+                    qualityIndex = (qualityIndex + 1) % QualityValues.Length;
+                }
+
+                showNoQualityHint = false;   // (not remembered yet: only a search that really runs keeps the star, see lastQualityIndex)
                 Game1.playSound("smallSelect");
             }
 
@@ -1639,7 +1758,31 @@ namespace ChestItemFinder
         /// </summary>
         private string ApplySuggestion(int index)
         {
-            return suggestionPrefix + suggestions[index].Text;
+            // one of the category rows of several categories: all of them, as separate search words in the order typed:
+            // "fish (category), fruit (category), egg (category)"
+            if (multiCategoryTerms != null && index < multiCategoryRowCount)
+            {
+                // one of the rows of the words: all of them, as separate search words in the order typed:
+                // "Ancient Fruit, fish (category), egg (category)"
+                return multiCategoryLead + string.Join(", ", multiCategoryTerms.Select(term =>
+                {
+                    string plain = ModEntry.StripCategorySuffix(term);
+                    return ModEntry.IsCategoryWord(plain) && !ModEntry.TryStripItemLabel(term, out _) ? plain + " (category)" : term;
+                }));
+            }
+
+            // "Egg (item)" after other words: the words before it become comma-separated search words ("fish Egg (item)" could not be told apart
+            // from a name with brackets): "fish, Egg (item)"
+            string text = suggestions[index].Text;
+            if (ModEntry.TryStripItemLabel(text, out _) && suggestionPrefix.Trim().Length > 0 && !suggestionPrefix.TrimEnd().EndsWith(",", StringComparison.Ordinal))
+            {
+                string words = ExtractQuality(suggestionPrefix, out _, out _, out string qualityWords).Trim();   // "gold star" stays in front
+                List<string> pieces = ModEntry.SplitKeepingCategories(words);
+                string front = qualityWords.Length > 0 ? qualityWords + " " : "";
+                return pieces.Count == 0 ? front + text : front + string.Join(", ", pieces) + ", " + text;
+            }
+
+            return suggestionPrefix + text;
         }
 
         /// <summary>
@@ -1652,14 +1795,149 @@ namespace ChestItemFinder
         ///   nothing, the last space-separated word is completed on its own ("fruit fi" completes "fi").
         /// The words in front of it are remembered in <see cref="suggestionPrefix"/>, so picking a suggestion never overwrites them.
         /// </summary>
+        /// <summary>
+        /// The drop-down for a text of several COMPLETE words (with or without commas): "fish fruit egg", "ancient fruit, fish, egg", "egg, Strawberry".
+        /// False when it is fewer than two words or the last one is still being typed (then the drop-down completes the last word as usual).
+        ///   - on top, one row per word, the last typed first: a category as "egg (category)", an item as its name with its icon;
+        ///   - then, for each category in the same order, the rows it gets when it is typed alone (every egg, then every fish ...); items get none.
+        /// A repeated word counts once; at most three words count (a fourth is left out, see the note above the box).
+        /// </summary>
+        private bool TryGetMultiTermRows(string query, out List<string> terms, out List<Suggestion> rows)
+        {
+            terms = new List<string>();
+            rows = new List<Suggestion>();
+            if (getSuggestions == null || query.IndexOfAny(new[] { ' ', ',', '\uFF0C', '\u3001' }) < 0)
+                return false;
+
+            List<string> pieces = ModEntry.ResolveBoxTerms(query);
+            if (pieces.Count < 2 || !pieces.All(ModEntry.IsCompleteTerm))
+                return false;
+
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            terms = pieces.Select(ModEntry.WithCategoryAlias)
+                .Where(piece => seen.Add(ModEntry.TermIdentity(piece)))
+                .Take(ModEntry.MaxSearchTerms)
+                .ToList();
+            if (terms.Count < 2)
+                return false;   // "egg egg": one word, the normal drop-down
+
+            var listed = new HashSet<string>(StringComparer.Ordinal);
+            var blocks = new List<IReadOnlyList<Suggestion>>();
+
+            // 1. one row per word, the last typed first
+            for (int i = terms.Count - 1; i >= 0; i--)
+            {
+                string term = terms[i];
+                string plain = ModEntry.StripCategorySuffix(term);
+                bool isCategory = ModEntry.IsCategoryWord(plain);
+                IReadOnlyList<Suggestion> list = ModEntry.TryStripItemLabel(term, out _) ? Array.Empty<Suggestion>() : getSuggestions(plain);
+
+                // Suggestion is a struct (FirstOrDefault never gives null), so the row is looked up by index
+                string key = SuggestionIndex.MakeKey(plain);
+                int at = -1;
+                for (int r = 0; r < list.Count && at < 0; r++)
+                {
+                    if (list[r].IsCategory == isCategory && SuggestionIndex.MakeKey(list[r].Text) == key)
+                        at = r;
+                }
+                for (int r = 0; r < list.Count && at < 0 && isCategory; r++)
+                {
+                    if (list[r].IsCategory)
+                        at = r;
+                }
+
+                Suggestion row = at >= 0 ? list[at] : new Suggestion(isCategory ? plain : term, 0, isCategory: isCategory);
+                rows.Add(row);
+                listed.Add(SuggestionIndex.MakeKey(row.Text));
+                if (isCategory)
+                    blocks.Add(list);
+            }
+
+            // 2. what each category gets on its own, in the same order (a row already listed is not listed again)
+            foreach (IReadOnlyList<Suggestion> list in blocks)
+            {
+                foreach (Suggestion row in list)
+                {
+                    if (listed.Add(SuggestionIndex.MakeKey(row.Text)))
+                        rows.Add(row);
+                }
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// The big white note above the box ("Only 3 at a time: "wine" is ignored."). It follows the text, not a timer: it is there as long as the text
+        /// holds a fourth word (its words change with the text), and disappears at once (no fade) when the last letter of the fourth word is
+        /// deleted. It only informs: the search still runs, with the first three. A last word still being typed that is only the start of an earlier word ("egg fruit
+        /// fish eg": the second egg on its way) does not count yet.
+        /// </summary>
+        private void UpdateCategoryNote(string text)
+        {
+            List<string> ignored;
+            try
+            {
+                ignored = ModEntry.GetIgnoredSearchTerms(text);
+            }
+            catch (Exception)
+            {
+                ignored = new List<string>();
+            }
+
+            // the word being typed (the last one, no space / comma after it yet) that starts like an earlier word: maybe a repeat on its way
+            string trimmed = (text ?? "").TrimEnd();
+            bool stillTyping = trimmed.Length == (text ?? "").Length && trimmed.Length > 0 && !char.IsWhiteSpace(trimmed[^1]) && trimmed[^1] != ',';
+            if (stillTyping && ignored.Count > 0)
+            {
+                string last = SuggestionIndex.MakeKey(ignored[^1]);
+                List<string> typedWords = SuggestionIndex.TypedWordKeys(trimmed.Replace(',', ' '));
+                bool startsLikeEarlierWord = typedWords.Take(Math.Max(0, typedWords.Count - 1))
+                    .Any(word => word.Length > last.Length && word.StartsWith(last, StringComparison.Ordinal));
+                if (last.Length > 0 && startsLikeEarlierWord)
+                    ignored.RemoveAt(ignored.Count - 1);
+            }
+
+            if (ignored.Count == 0)
+            {
+                // the fourth word is gone (its last letter deleted): the note is gone at once, no fade
+                categoryNoteKey = null;
+                categoryNoteText = null;
+                return;
+            }
+
+            string words = string.Join(", ", ignored.Select(word => "\"" + word + "\""));
+            categoryNoteText = $"Only {ModEntry.MaxSearchTerms} at a time: {words} {(ignored.Count == 1 ? "is" : "are")} ignored.";
+            categoryNoteKey = string.Join("|", ignored.Select(SuggestionIndex.MakeKey));
+        }
+
+        /// <summary>Draws the note of UpdateCategoryNote above the box (below it if there is no room above), while there is one.</summary>
+        private void DrawCategoryNote(SpriteBatch b)
+        {
+            if (categoryNoteText == null)
+                return;
+
+            SpriteFont font = Game1.dialogueFont;
+            Vector2 size = font.MeasureString(categoryNoteText);
+            float scale = Math.Min(1f, (Game1.uiViewport.Width - 32) / Math.Max(1f, size.X));
+            float x = Math.Max(16f, xPositionOnScreen + width / 2f - size.X * scale / 2f);
+            float y = yPositionOnScreen + 40 - size.Y * scale - 12;   // above the title of the box
+            if (y < 8)
+                y = yPositionOnScreen + height + 8;                    // no room above: under the box
+            Utility.drawTextWithShadow(b, categoryNoteText, font, new Vector2(x, y), Color.White, scale);
+        }
+
         private void RefreshSuggestions()
         {
             activeSuggestion = -1;
             suggestionScroll = 0;          // a new list always starts at its top
             draggingScrollbar = false;
             suggestionPrefix = "";
+            multiCategoryTerms = null;
+            multiCategoryRowCount = 0;
             spellingWords.Clear();         // the instant correction is worked out again below, only for a word without any suggestion
             spellingPrefix = "";
+            impossible = null;             // and the lines of a product the game never makes
+            impossibleRefused = false;
 
             string text = textBox.Text;
             if (suppressedText != null && text != suppressedText)
@@ -1669,6 +1947,7 @@ namespace ChestItemFinder
             // picked word keeps the quality in front of it ("gold star Apple")
             text = ExtractQuality(text, out typedQuality, out _, out string qualityPhrase);
             string qualityLead = qualityPhrase.Length > 0 ? qualityPhrase + " " : "";
+            UpdateCategoryNote(text);
 
             string query = text.Trim();
             if (getSuggestions == null || query.Length == 0)
@@ -1682,7 +1961,38 @@ namespace ChestItemFinder
             IReadOnlyList<Suggestion> found = Array.Empty<Suggestion>();
 
             int comma = text.LastIndexOfAny(ModEntry.QueryCommas);   // half-width or full-width
-            if (comma >= 0)
+
+            // a product the game never makes ("corn jelly", see IMPOSSIBLE PRODUCT LINES): no drop-down (Corn and every fruit jelly would only
+            // mislead), but the two lines: what the ingredient really becomes, and "Did you mean" with the rest and the two words apart
+            if (comma < 0 && ModEntry.GetImpossibleProduct(query) is SuggestionIndex.ImpossibleProduct impossibleInfo)
+            {
+                suggestions = Array.Empty<Suggestion>();
+                impossible = impossibleInfo;
+                spellingWords.AddRange(impossibleInfo.Alternatives);
+                if (impossibleInfo.Split != null)
+                    spellingWords.Add(impossibleInfo.Split);
+                spellingPrefix = qualityLead;
+                return;
+            }
+
+            // an alias or another spelling of a name ("honey wine" -> Mead, "cranberry jelly" -> Cranberries Jelly) is ONE name, never several words
+            bool resolvedName = comma < 0 && ModEntry.TryResolveName(query, out _, out _);
+
+            if (!resolvedName && TryGetMultiTermRows(query, out List<string> multiTerms, out List<Suggestion> multiRows))
+            {
+                // SEVERAL COMPLETE WORDS ("fish fruit egg", "ancient fruit, fish, egg"): one row per word on top, the last typed first; then the
+                // rows each category gets when it is typed alone, in the same order. A fourth word is left out (see the note above the box).
+                found = multiRows;
+                multiCategoryTerms = multiTerms;
+                multiCategoryRowCount = multiTerms.Count;
+                multiCategoryLead = qualityLead;
+                int cut = Math.Max(query.LastIndexOfAny(SpaceChars), query.LastIndexOfAny(ModEntry.QueryCommas));
+                prefix = query.Substring(0, cut + 1);   // an item row of a block replaces the last word, as before
+                if (prefix.Length > 0 && !char.IsWhiteSpace(prefix[^1]))
+                    prefix += " ";
+                term = query.Substring(cut + 1).Trim();
+            }
+            else if (comma >= 0)
             {
                 prefix = text.Substring(0, comma + 1).TrimStart() + " ";
                 term = text.Substring(comma + 1).Trim();
@@ -1775,10 +2085,14 @@ namespace ChestItemFinder
 
             SpriteFont font = Game1.smallFont;
             int left = xPositionOnScreen + 48;
-            int top = yPositionOnScreen + SpellingRowOffsetY;
+            int top = SpellingRowTop;
             int right = left + width - 96;
             int commaWidth = (int)Math.Ceiling(font.MeasureString(", ").X);
             int cursor = left + (int)Math.Ceiling(font.MeasureString(SpellingLead).X);
+
+            // under the lines of a product the game never makes, the last word ("corn, jelly") always shows: its room is kept free
+            string? keepLast = impossible?.Split;
+            int keepWidth = keepLast != null ? commaWidth + (int)Math.Ceiling(font.MeasureString(keepLast).X) : 0;
 
             // A word is only ever shown COMPLETE. The words come best first, so a word that does not fit into what is left of the line is simply left
             // out (it is a weaker match than the ones before it): better two whole words than a third one cut to "Mushroom Tre...". A later, shorter
@@ -1787,7 +2101,8 @@ namespace ChestItemFinder
             {
                 string label = ModEntry.StripCategorySuffix(name);
                 int separator = chips.Count > 0 ? commaWidth : 0;
-                int room = right - cursor - separator;
+                bool isKept = keepLast != null && ReferenceEquals(name, keepLast);
+                int room = right - cursor - separator - (isKept ? 0 : keepWidth);
                 int fullWidth = (int)Math.Ceiling(font.MeasureString(label).X);
 
                 if (chips.Count > 0 && fullWidth > room)
@@ -1819,7 +2134,7 @@ namespace ChestItemFinder
             int mouseX = Game1.getMouseX();
             int mouseY = Game1.getMouseY();
 
-            Utility.drawTextWithShadow(b, SpellingLead, font, new Vector2(xPositionOnScreen + 48, yPositionOnScreen + SpellingRowOffsetY), Game1.textColor);
+            Utility.drawTextWithShadow(b, SpellingLead, font, new Vector2(xPositionOnScreen + 48, SpellingRowTop), Game1.textColor);
 
             for (int i = 0; i < chips.Count; i++)
             {
@@ -1844,7 +2159,7 @@ namespace ChestItemFinder
             foreach (var chip in LayoutSpelling())
             {
                 if (SpellingHitBox(chip.Bounds).Contains(x, y))
-                    return GetWordTipCached(chip.Name);
+                    return impossible != null ? GetImpossibleWordTip(chip.Name) : GetWordTipCached(chip.Name);
             }
 
             return null;
@@ -1853,6 +2168,13 @@ namespace ChestItemFinder
         /// <summary>A click on a word of the line: it goes into the text box and nothing else happens (no search, no drop-down). True = the click was on a word.</summary>
         private bool TryApplySpellingClick(int x, int y)
         {
+            // the product in the first line of a product the game never makes ("Corn becomes Pickled Corn ..."): the same as a word of the line
+            if (ImpossibleVisible && LayoutImpossible().Link.Contains(x, y))
+            {
+                ApplySpellingName(impossible!.Link);
+                return true;
+            }
+
             if (!SpellingVisible)
                 return false;
 
@@ -1861,18 +2183,128 @@ namespace ChestItemFinder
                 if (!SpellingHitBox(chip.Bounds).Contains(x, y))
                     continue;
 
-                textBox.Text = spellingPrefix + ModEntry.StripCategorySuffix(chip.Name);   // the caret goes to the end
-                lastText = textBox.Text;      // update() must not take this for an edit: no new drop-down, no new line
-                showTooShortHint = false;
-                showNoQualityHint = false;
-                SuppressSuggestions();        // closes the drop-down for this text; the spelling line is checked again for the new text
-                Game1.playSound("smallSelect");
-                textBox.Selected = true;
-                Game1.keyboardDispatcher.Subscriber = textBox;
+                ApplySpellingName(chip.Name);
                 return true;
             }
 
             return false;
+        }
+
+        /// <summary>Puts a word of the "Did you mean" line (or the product of the first impossible-product line) into the text box, nothing else.</summary>
+        private void ApplySpellingName(string name)
+        {
+            textBox.Text = spellingPrefix + ModEntry.StripCategorySuffix(name);   // the caret goes to the end
+            lastText = textBox.Text;      // update() must not take this for an edit (the drop-down is worked out right here)
+            showTooShortHint = false;
+            showNoQualityHint = false;
+            // exactly as if the word had been typed (without Enter), like a word picked from the history: the drop-down shows what typing it
+            // would show ("Milk" -> milk (category), Large Milk, Goat Milk ...); the spelling line is checked again for the new text
+            suppressedText = null;
+            RefreshSuggestions();
+            Game1.playSound("smallSelect");
+            textBox.Selected = true;
+            Game1.keyboardDispatcher.Subscriber = textBox;
+        }
+
+        // ===================== IMPOSSIBLE PRODUCT LINES ("corn jelly", see SuggestionIndex, IMPOSSIBLE PRODUCTS) =====================
+        // Two lines in the hint spot while the text names a product the game never makes:
+        //   line 1: "Corn becomes Pickled Corn in a Preserves Jar."  The product is a link (blue, underlined): a click puts it into the box
+        //           (Enter still searches). The ingredient word has the tip "There's no Corn Jelly in the game.", every product its usual tip
+        //           plus how it is made ("Corn becomes Pickled Corn in a Preserves Jar."; several makers: "Corn, Sunflower and Sunflower Seeds
+        //           make Oil in an Oil Maker.", the typed one and its family first).
+        //   line 2: "Did you mean: Corn Juice, Oil, corn, jelly"  The other products, then the two words apart (always shown: "Searches ... separately").
+        // They come as soon as the text is recognised, in the normal text color. Enter refuses the text (the usual refusal sound) and a red line
+        // under them says what to do: "There's no Corn Jelly. Pick a blue name, or type a new search." (gone at once when the text changes).
+
+        /// <summary>The lines of the text in the box, or null (worked out in RefreshSuggestions).</summary>
+        private SuggestionIndex.ImpossibleProduct? impossible;
+
+        /// <summary>Enter was pressed on it: a red line under "Did you mean" says what to do, until the text changes (then it is gone at once).</summary>
+        private bool impossibleRefused;
+
+        /// <summary>The lines are shown while there are some and no red hint needs the spot.</summary>
+        private bool ImpossibleVisible => ticks >= 3 && impossible != null && !showTooShortHint && !showNoQualityHint && textBox.Text.Trim().Length > 0;
+
+        /// <summary>Room between the lines of a product the game never makes (they read better a little apart).</summary>
+        private const int ImpossibleLineGap = 8;
+
+        /// <summary>The top of the "Did you mean" line: one line (and the gap) lower while the impossible-product line is above it.</summary>
+        private int SpellingRowTop => yPositionOnScreen + SpellingRowOffsetY + (ImpossibleVisible ? Game1.smallFont.LineSpacing + ImpossibleLineGap : 0);
+
+        /// <summary>Line 1, laid out: where it starts, its scale (shrunk only if it would not fit), and the boxes of the ingredient word and of the product.</summary>
+        private (Vector2 Start, float Scale, Rectangle Subject, Rectangle Link) LayoutImpossible()
+        {
+            SpriteFont font = Game1.smallFont;
+            var info = impossible!;
+            float full = font.MeasureString(info.Subject + info.Middle + info.Link + info.Tail).X;
+            float scale = Math.Min(1f, (width - 96) / Math.Max(1f, full));
+            var start = new Vector2(xPositionOnScreen + 48, yPositionOnScreen + SpellingRowOffsetY);
+            int height = (int)Math.Ceiling(font.LineSpacing * scale);
+
+            float subjectWidth = font.MeasureString(info.Subject).X * scale;
+            float linkX = start.X + font.MeasureString(info.Subject + info.Middle).X * scale;
+            float linkWidth = font.MeasureString(info.Link).X * scale;
+            var subject = new Rectangle((int)start.X, (int)start.Y, (int)Math.Ceiling(subjectWidth), height);
+            var link = new Rectangle((int)linkX, (int)start.Y, (int)Math.Ceiling(linkWidth), height);
+            return (start, scale, subject, link);
+        }
+
+        private void DrawImpossible(SpriteBatch b)
+        {
+            SpriteFont font = Game1.smallFont;
+            var info = impossible!;
+            var layout = LayoutImpossible();
+            Color text = Game1.textColor;
+
+            int mouseX = Game1.getMouseX();
+            int mouseY = Game1.getMouseY();
+            bool linkHovered = SpellingHitBox(layout.Link).Contains(mouseX, mouseY);
+            Color linkColor = linkHovered ? SpellingHoverColor : SpellingColor;
+
+            float x = layout.Start.X;
+            Utility.drawTextWithShadow(b, info.Subject + info.Middle, font, new Vector2(x, layout.Start.Y), text, layout.Scale);
+            Utility.drawTextWithShadow(b, info.Link, font, new Vector2(layout.Link.X, layout.Start.Y), linkColor, layout.Scale);
+            b.Draw(Game1.staminaRect, new Rectangle(layout.Link.X, layout.Link.Bottom - 4, layout.Link.Width, linkHovered ? 3 : 2), linkColor * (linkHovered ? 1f : 0.7f));
+            Utility.drawTextWithShadow(b, info.Tail, font, new Vector2(layout.Link.Right, layout.Start.Y), text, layout.Scale);
+
+            if (spellingWords.Count > 0)
+                DrawSpelling(b);   // line 2 ("Did you mean: ..."), one line lower (SpellingRowTop)
+
+            // Enter on it: say plainly what to do now, in red like every refusal, right under the choices
+            if (impossibleRefused)
+            {
+                int top = spellingWords.Count > 0 ? SpellingRowTop + font.LineSpacing + ImpossibleLineGap : SpellingRowTop;
+                string refusal = Game1.parseText($"There's no {info.Missing}. Pick a blue name, or type a new search.", font, width - 96);
+                Utility.drawTextWithShadow(b, refusal, font, new Vector2(xPositionOnScreen + 48, top), Color.DarkRed);
+            }
+        }
+
+        /// <summary>The hover tip of line 1 under the mouse: the ingredient word ("There's no Corn Jelly in the game.") or the product, else null.</summary>
+        private string? GetImpossibleTipAt(int x, int y)
+        {
+            if (!ImpossibleVisible)
+                return null;
+            var layout = LayoutImpossible();
+            if (layout.Subject.Contains(x, y))
+                return impossible!.SubjectTip;
+            if (SpellingHitBox(layout.Link).Contains(x, y))
+                return GetImpossibleWordTip(impossible!.Link);
+            return null;
+        }
+
+        /// <summary>The tip of a product (its usual tip, then how it is made) or of the two words apart ("Searches "corn" and "jelly" separately.").</summary>
+        private string? GetImpossibleWordTip(string name)
+        {
+            var info = impossible;
+            if (info == null)
+                return GetWordTipCached(name);
+            if (info.Split != null && string.Equals(name, info.Split, StringComparison.Ordinal))
+                return $"Searches \"{info.SplitFirst}\" and \"{info.SplitSecond}\" separately.";
+
+            string? tip = getWordTip != null ? GetWordTipCached(name) : null;
+            if (info.Sources.TryGetValue(name, out string? source))
+                tip = tip == null ? source : tip + "\n" + source;
+            return tip;
         }
 
         /// <summary>Hover tip of a category word ("Roe (category)"): the same text as everywhere else (result title, search history).</summary>
@@ -1883,12 +2315,28 @@ namespace ChestItemFinder
 
         private static readonly Dictionary<string, Item?> suggestionIconCache = new();
 
+        // The real items the chests hold, one per name (suggestion key), set every time the search box opens (ModEntry.GetChestIconSamples).
+        // A row of a held item is drawn with it, so it looks exactly like in the chest. Kept apart from suggestionIconCache on purpose: what the
+        // chests hold changes between two openings, the icons of the game's own items never do.
+        private static Dictionary<string, Item> ownedIconSamples = new();
+
+        /// <summary>Sets the real items of the chests the drop-down draws its icons with (see ownedIconSamples).</summary>
+        internal static void SetOwnedIconSamples(Dictionary<string, Item>? samples)
+        {
+            ownedIconSamples = samples ?? new Dictionary<string, Item>();
+        }
+
         /// <summary>The item whose real icon is drawn in front of a suggestion, or null (category words, unknown names, category ids). Created once per item id.</summary>
         private static Item? GetSuggestionIconItem(Suggestion suggestion)
         {
             if (suggestion.IsCategory)
                 return null;
 
+            // 1. the chests hold it: the real item (a built name like "Apple Wine" gets its colour from it, see ownedIconSamples)
+            if (suggestion.IdLabel == null && ownedIconSamples.TryGetValue(SuggestionIndex.MakeKey(suggestion.Text), out Item? owned))
+                return owned;
+
+            // 2. a name the game builds (its ingredient), 3. the plain item of its id
             string? qualifiedId = suggestion.QualifiedId;
             if (qualifiedId == null && suggestion.IdLabel != null
                 && int.TryParse(suggestion.Text, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out int number) && number >= 0)
@@ -1897,13 +2345,17 @@ namespace ChestItemFinder
             if (qualifiedId == null)
                 return null;
 
-            if (suggestionIconCache.TryGetValue(qualifiedId, out Item? cached))
+            // a name the game builds ("Starfruit Wine"): the real flavoured item, so the icon has the ingredient's colour like in the game
+            string cacheKey = suggestion.IngredientId != null ? qualifiedId + "|" + suggestion.IngredientId : qualifiedId;
+            if (suggestionIconCache.TryGetValue(cacheKey, out Item? cached))
                 return cached;
 
             Item? item = null;
             try
             {
-                if (ItemRegistry.GetData(qualifiedId) != null)
+                if (suggestion.IngredientId != null)
+                    item = ModEntry.CreateFlavoredItem(qualifiedId, suggestion.IngredientId);
+                if (item == null && ItemRegistry.GetData(qualifiedId) != null)
                     item = ItemRegistry.Create(qualifiedId);
             }
             catch (Exception)
@@ -1911,7 +2363,7 @@ namespace ChestItemFinder
                 item = null;   // no icon rather than a crash
             }
 
-            suggestionIconCache[qualifiedId] = item;
+            suggestionIconCache[cacheKey] = item;
             return item;
         }
 
@@ -2033,6 +2485,8 @@ namespace ChestItemFinder
             if (!draggingScrollbar && highlighted >= suggestionScroll && highlighted < suggestionScroll + rows && highlighted < suggestions.Count)
             {
                 suggestionTipText = getWordTip != null ? GetWordTipCached(suggestions[highlighted].Text) : GetSuggestionTip(suggestions[highlighted]);
+                if (suggestions[highlighted].AliasNote is string aliasNote)   // an alias row: say first that it is the same thing
+                    suggestionTipText = suggestionTipText == null ? aliasNote : aliasNote + "\n" + suggestionTipText;
                 suggestionTipRowTop = box.Y + SuggestionPadY + (highlighted - suggestionScroll) * rowHeight;
             }
 
@@ -2055,6 +2509,10 @@ namespace ChestItemFinder
 
                 // the tag after the word: " (category)" for a category word, " (Starfruit)" / " (fruit)" (the name of the id) for an id suggestion
                 string? tag = suggestion.IsCategory ? CategoryTag : null;
+
+                // an alias row: the words the player typed, quiet, after the game's name ("Raisins (dried grape)")
+                if (suggestion.AliasText != null)
+                    tag = " (" + suggestion.AliasText + ")";
 
                 // A "popular item of the category" row (typing "fish" offers Sturgeon) shows ONLY the item name: no " (Fish)" / " (Litter)" after it.
                 // The category it belongs to is shown in the hover tip (see GetSuggestionTip).
@@ -3261,6 +3719,43 @@ namespace ChestItemFinder
         /// <summary>The X is hidden (and cannot be clicked) while the auto-complete drop-down covers it.</summary>
         private bool CloseButtonVisible => !SuggestionsVisible || !GetSuggestionBounds().Intersects(CloseButtonBounds);
 
+        private bool closedByX = false;
+
+        /// <summary>The red X was clicked: the menu closes (once).</summary>
+        private void CloseByX()
+        {
+            if (closedByX)
+                return;
+            closedByX = true;
+            exitThisMenu();
+        }
+
+        /// <summary>Esc, or B on a controller: first closes an open "Copy" bubble, a second press the search box.</summary>
+        private void CancelLikeEsc()
+        {
+            if (copyBubble.IsOpen)
+            {
+                copyBubble.Close();
+                return;
+            }
+            exitThisMenu();
+        }
+
+        /// <summary>
+        /// A controller: B closes the search box like Esc. The game's own "B = close the menu" goes through the base receiveKeyPress, which this
+        /// menu never calls (it would close the box while typing letters like "E"), so without this a controller had no way out of the box.
+        /// Every other button does what it always did.
+        /// </summary>
+        public override void receiveGamePadButton(Buttons button)
+        {
+            if (button == Buttons.B)
+            {
+                CancelLikeEsc();
+                return;
+            }
+            base.receiveGamePadButton(button);
+        }
+
         private void DrawCloseButton(SpriteBatch b)
         {
             Rectangle bounds = CloseButtonBounds;
@@ -3312,6 +3807,8 @@ namespace ChestItemFinder
                 new Vector2(xPositionOnScreen + 48, yPositionOnScreen + 40),
                 Game1.textColor);
 
+            DrawCategoryNote(b);
+
             textBox.Draw(b);
             DrawPasteButton(b);
             DrawClearTextButton(b);
@@ -3334,7 +3831,7 @@ namespace ChestItemFinder
             {
                 string hint = Game1.parseText(
                     typedQuality != null
-                        ? "Item found, but no matching quality. Try another quality word."
+                        ? "Item found, but no matching quality. Try another quality."
                         : "Item found, but no matching quality. Try adjusting the star filter.",
                     Game1.smallFont,
                     width - 96);
@@ -3345,6 +3842,10 @@ namespace ChestItemFinder
                     Game1.smallFont,
                     new Vector2(xPositionOnScreen + 48, yPositionOnScreen + 166),
                     Color.DarkRed);
+            }
+            else if (ImpossibleVisible)
+            {
+                DrawImpossible(b);   // a product the game never makes: what it really becomes, and "Did you mean" (see IMPOSSIBLE PRODUCT LINES)
             }
             else if (SpellingVisible)
             {
@@ -3376,13 +3877,19 @@ namespace ChestItemFinder
 
             // the tip of the history word under the mouse (same text as the result page; a typo gets the Invalid line)
             string? historyTip = HistoryVisible ? GetHistoryTipAt(Game1.getMouseX(), Game1.getMouseY()) : null;
-            string? spellingTip = GetSpellingTipAt(Game1.getMouseX(), Game1.getMouseY());   // the "(category)" label of a corrected word shows here
+            string? spellingTip = GetImpossibleTipAt(Game1.getMouseX(), Game1.getMouseY()) ?? GetSpellingTipAt(Game1.getMouseX(), Game1.getMouseY());   // the "(category)" label of a corrected word shows here
 
             // hovering the star shows which quality is selected
             if (starButton.Contains(Game1.getMouseX(), Game1.getMouseY()))
-                IClickableMenu.drawHoverText(b, typedQuality is int typed
+            {
+                string starTip = typedQuality is int typed
                     ? QualityLabels[Math.Max(0, Array.IndexOf(QualityValues, typed))] + " (set by the search text)"
-                    : QualityLabels[qualityIndex], Game1.smallFont);
+                    : QualityLabels[qualityIndex];
+                string? noQualityLine = NoQualityStarLine;
+                if (noQualityLine != null)
+                    starTip += "\n" + noQualityLine;   // the chosen star stays as it is; the tip only adds that it does not apply here
+                IClickableMenu.drawHoverText(b, starTip, Game1.smallFont);
+            }
             else if (MagnifierBounds.Contains(Game1.getMouseX(), Game1.getMouseY()))
                 IClickableMenu.drawHoverText(b, "Search", Game1.smallFont);
             else if (PasteBounds.Contains(Game1.getMouseX(), Game1.getMouseY()))
@@ -3439,6 +3946,9 @@ namespace ChestItemFinder
 
         /// <summary>True while the bubble is open.</summary>
         public bool IsOpen => open;
+
+        /// <summary>True while the bubble is open and (x, y) lies on one of its buttons ("Copy" / "Paste").</summary>
+        public bool IsOverButton(int x, int y) => open && (copyBounds.Contains(x, y) || pasteBounds.Contains(x, y));
 
         /// <summary>True while the "Copied!" note is still on screen.</summary>
         public bool NoteVisible => clock.ElapsedMilliseconds < noteUntilMs;

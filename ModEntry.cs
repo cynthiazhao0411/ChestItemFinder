@@ -10,6 +10,8 @@ using StardewModdingAPI;
 using StardewModdingAPI.Events;
 using StardewValley;
 using StardewValley.BellsAndWhistles;
+using StardewValley.Buildings;
+using StardewValley.TokenizableStrings;
 using StardewValley.ItemTypeDefinitions;
 using StardewValley.Menus;
 using StardewValley.Objects;
@@ -79,9 +81,19 @@ namespace ChestItemFinder
         // Kept separately from highlightedChests, so the list still works after a chest is opened and the highlights are cleared.
         private readonly Dictionary<string, Dictionary<string, int>> placeItems = new();
 
+        // the order of the items in the item list of a place: by the search word that found them (in the order typed: egg first, then fish,
+        // then strawberry), and inside one word in the order of its tip / drop-down (items of one root together: Starfruit, Starfruit Wine)
+        private Dictionary<string, (int Term, int Position)> placeItemOrder = new();
+
         // What the highlights are for, as shown in the corner status line ("Highlighting: 'Apple' (12 chests)"): the searched words that found
         // something, quoted. Set by a successful search; the line itself only shows while there are highlighted chests (see DrawHighlightStatus).
         private string highlightLabel = "";
+
+        // Per place key: how many found containers of each kind (for the brackets of the place list: "Farmhouse x2 (fridges)"), and the matching items
+        // per section ("chest" = every chest size, or a special kind's key) with how many containers each section has (for the sections of a place's
+        // item list when a place mixes kinds: "Chest / Milk ×3", "Fridge / Milk ×5").
+        private readonly Dictionary<string, Dictionary<ContainerKind, int>> placeKindCounts = new();
+        private readonly Dictionary<string, Dictionary<string, Dictionary<string, int>>> placeSectionItems = new();
 
         // One sample item (stack 1, no star) for every item name in placeItems, so the item list of a hovered place can draw the real icon of each item.
         private readonly Dictionary<string, Dictionary<string, Item>> placeSamples = new();
@@ -123,14 +135,14 @@ namespace ChestItemFinder
             ["Desert"] = "Calico Desert",
             ["Woods"] = "Secret Woods",
             ["Sewer"] = "Sewers",
-            ["IslandSouth"] = "Ginger Island (South)",
-            ["IslandSouthEast"] = "Ginger Island (Southeast)",
-            ["IslandEast"] = "Ginger Island (East)",
-            ["IslandWest"] = "Ginger Island (West)",
-            ["IslandNorth"] = "Ginger Island (North)",
+            ["IslandSouth"] = "Ginger Island (Docks)",
+            ["IslandSouthEast"] = "Ginger Island (Tide Pool)",
+            ["IslandEast"] = "Ginger Island (Jungle)",
+            ["IslandWest"] = "Ginger Island (Farm)",
+            ["IslandNorth"] = "Ginger Island (Dig Site)",
             ["IslandFarmHouse"] = "Ginger Island Farmhouse",
             ["IslandFarmCave"] = "Ginger Island Farm Cave",
-            ["IslandHut"] = "Ginger Island Hut",
+            ["IslandHut"] = "Ginger Island Leo's Hut",
             ["IslandFieldOffice"] = "Ginger Island Field Office"
         };
 
@@ -180,8 +192,12 @@ namespace ChestItemFinder
             return TimeoutSecondsChoices.OrderBy(choice => Math.Abs(choice - seconds)).First();
         }
 
+        /// <summary>The running mod (the search box asks it how a text splits into search words, see GetIgnoredSearchTerms).</summary>
+        internal static ModEntry? Instance { get; private set; }
+
         public override void Entry(IModHelper helper)
         {
+            Instance = this;
             Config = helper.ReadConfig<ModConfig>();
             Config.HighlightTimeoutSeconds = NormalizeTimeoutSeconds(Config.HighlightTimeoutSeconds);
             // opacity is 0-100 in steps of 20; fix up hand-edited config.json values
@@ -312,6 +328,12 @@ namespace ChestItemFinder
             try
             {
                 GetGameItemCatalog();
+
+                // the item names that have brackets of their own ("Crop Tank Top (F)"): typed whole, their brackets are allowed (see IsBracketItemName)
+                bracketItemNames = null;
+                List<string> withBrackets = GetBracketItemNames();
+                if (withBrackets.Count > 0)
+                    Monitor.Log($"Item names with brackets (searchable as they are): {string.Join(", ", withBrackets)}", LogLevel.Trace);
             }
             catch (Exception ex)
             {
@@ -508,7 +530,7 @@ namespace ChestItemFinder
             lastSearchKeyTick = Game1.ticks;
             Helper.Input.SuppressActiveKeybinds(Config.SearchKey);
             // e.Button is the key that completed the combo (e.g. T in LeftShift + T, or LeftShift if T was already held)
-            Game1.activeClickableMenu = new SearchMenu(ScanChests, searchHistory, SaveSearchHistory, GetLeakedChar(e.Button), CreateSuggestionProvider(), getWordTip: GetTermTip, getSpelling: CreateSpellingProvider());
+            Game1.activeClickableMenu = new SearchMenu(ScanChests, searchHistory, SaveSearchHistory, GetLeakedChar(e.Button), CreateSuggestionProvider(), getWordTip: GetTermTip, getSpelling: CreateSpellingProvider(), textHasNoQuality: TextRefersOnlyToNoQualityItems);
         }
 
         // Prepares the auto-complete for one opening of the search box. If anything goes wrong this returns null and the
@@ -520,6 +542,7 @@ namespace ChestItemFinder
                 suggestionIndex ??= new SuggestionIndex();
                 suggestionIndex.EnsureBuilt();                          // game item names (built once, rebuilt if the language or item data changed)
                 suggestionIndex.SetOwnedItems(GetChestItemStacks());    // what is in the chests right now, with how many of each (slot 3 of every suggestion list: "the item you hold the most of")
+                SearchMenu.SetOwnedIconSamples(GetChestIconSamples());   // and how each of them really looks (the drop-down draws a held item with its own icon)
 
                 SuggestionIndex index = suggestionIndex;
                 // "fruit (category)" (or the start of it) is completed like "fruit", so the drop-down does not go blank while the tip is typed
@@ -533,93 +556,473 @@ namespace ChestItemFinder
             }
         }
 
-        // The display name of every item in every chest (same chests as ScanChests looks at).
+        // ===================== WHAT IS SEARCHED: EVERY CONTAINER THE PLAYER CAN OPEN AND STORE IN =====================
+        // Everything the search looks into comes from ONE place, GetAllContainers. Per location:
+        //   - every placed chest (Chest, Stone Chest, Big Chest, Big Stone Chest, Junimo Chest, Mini-Fridge ...: all Chest objects in location.objects);
+        //   - every Auto-Grabber (its storage is the Chest it holds);
+        //   - the built-in fridge of a house (farmhouse, cabins, Ginger Island farmhouse);
+        //   - the storage chests of buildings that the player can open and take from: the Mill's output box, the Junimo Hut's bag (and the same
+        //     kind of chest of a building added by another mod). The Mill's INPUT (where wheat is dropped in) is not storage and is left out;
+        //   - every dresser (they keep clothing, hats, shoes and rings). A dresser is no Chest: its items are mirrored into a stand-in Chest that the
+        //     player never sees (see dresserProxies), so the rest of the mod can treat it like any other container. Fish tanks are not storage.
+        // Machines that only LOOK like storage (kegs, preserves jars, crystalariums ...) are never containers.
+        // Nothing is "checked for" in advance: a location without a fridge, a farm without a mill simply yields nothing, at no extra cost.
+        // Everything after the collection (matching, highlights, arrow, place list, hover tips, "Found" note, status line) works with
+        // "location + tile + chest". What differs per kind is kept in containerInfo: the kind (for the words) and the footprint (the tiles the
+        // container covers: a fridge is two tiles tall, a building several tiles wide). Highlight, hover tip, "is it on screen" and "was it opened"
+        // all use the footprint.
+
+        /// <summary>One kind of container and its words. Chest and big chest share the arrow word and the hover section ("Chest").</summary>
+        private sealed class ContainerKind
+        {
+            public string Key { get; }
+            public string Singular { get; }      // in titles: "Found 1 fridge", "Found 1 Auto-Grabber"
+            public string Plural { get; }        // "Found 2 fridges"
+            public string ArrowName { get; }     // the arrow's label: "Fridge: Farmhouse"; chests of every size are just "Chest"
+            public bool IsSpecial { get; }       // not a chest: named in brackets in the place list, its own section in the place's item list
+            public int Order { get; }            // order of the sections in a place's item list (chests first)
+
+            public ContainerKind? Family { get; }   // the wider kind it belongs to: a mini-fridge is a fridge (null = its own family)
+
+            public ContainerKind(string key, string singular, string plural, string arrowName, bool isSpecial, int order, ContainerKind? family = null)
+            {
+                Key = key;
+                Singular = singular;
+                Plural = plural;
+                ArrowName = arrowName;
+                IsSpecial = isSpecial;
+                Order = order;
+                Family = family;
+            }
+
+            /// <summary>The kind that names a mix of this kind with others of its family (fridge + mini-fridge -> fridge).</summary>
+            public ContainerKind FamilyKind => Family ?? this;
+
+            /// <summary>The section key in a place's item list: every chest size is one section ("Chest"); fridge and mini-fridge are two ("Fridge" first).</summary>
+            public string SectionKey => IsSpecial ? Key : "chest";
+        }
+
+        private static readonly ContainerKind ChestKind = new("chest", "chest", "chests", "Chest", false, 0);
+        private static readonly ContainerKind BigChestKind = new("bigchest", "big chest", "big chests", "Chest", false, 0);
+        private static readonly ContainerKind FridgeKind = new("fridge", "fridge", "fridges", "Fridge", true, 1);
+        private static readonly ContainerKind MiniFridgeKind = new("minifridge", "mini-fridge", "mini-fridges", "Mini-Fridge", true, 2, FridgeKind);
+        private static readonly ContainerKind AutoGrabberKind = new("autograbber", "Auto-Grabber", "Auto-Grabbers", "Auto-Grabber", true, 3);
+        private static readonly ContainerKind JunimoHutKind = new("junimohut", "Junimo Hut", "Junimo Huts", "Junimo Hut", true, 4);
+        private static readonly ContainerKind MillKind = new("mill", "Mill", "Mills", "Mill", true, 5);
+        private static readonly ContainerKind DresserKind = new("dresser", "Dresser", "Dressers", "Dresser", true, 6);
+
+        /// <summary>The kinds of the storage chests of other mods' buildings, one per building type (named like the building).</summary>
+        private readonly Dictionary<string, ContainerKind> buildingKinds = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>What is known about one container: its kind, the tiles it covers, and its own full name (the title of its hover tip).</summary>
+        private readonly struct ContainerInfo
+        {
+            public readonly ContainerKind Kind;
+            public readonly Rectangle Footprint;   // in tiles
+            public readonly string FullName;
+
+            public ContainerInfo(ContainerKind kind, Rectangle footprint, string fullName)
+            {
+                Kind = kind;
+                Footprint = footprint;
+                FullName = fullName;
+            }
+        }
+
+        /// <summary>Every container met by GetAllContainers -> what is known about it (a chest that was never met is a plain one-tile chest).</summary>
+        private readonly Dictionary<Chest, ContainerInfo> containerInfo = new(ReferenceEqualityComparer.Instance);
+
+        /// <summary>Every dresser -> the stand-in Chest that mirrors its items (refreshed whenever the containers are listed or the dresser is opened).</summary>
+        private readonly Dictionary<StorageFurniture, Chest> dresserProxies = new(ReferenceEqualityComparer.Instance);
+
+        /// <summary>
+        /// Every searchable container of the given locations, each once, with its tile (for a building or a dresser: its top left tile) and the
+        /// location's place label.
+        /// </summary>
+        private IEnumerable<(GameLocation location, Vector2 position, Chest chest, string label)> GetAllContainers(IEnumerable<(GameLocation location, string label)> locations)
+        {
+            var seen = new HashSet<Chest>(ReferenceEqualityComparer.Instance);
+            var found = new List<(GameLocation location, Vector2 position, Chest chest, string label)>();
+
+            void Add(GameLocation location, Vector2 tile, Chest chest, string label, ContainerKind kind, Rectangle footprint, string fullName)
+            {
+                if (!seen.Add(chest))
+                    return;
+                containerInfo[chest] = new ContainerInfo(kind, footprint, fullName);
+                found.Add((location, tile, chest, label));
+            }
+
+            foreach (var (location, label) in locations)
+            {
+                found.Clear();
+                try
+                {
+                    // placed chests (every size, Junimo chests, mini-fridges: a placed chest that keeps food cold is a mini-fridge) and Auto-Grabbers
+                    foreach (var pair in location.objects.Pairs)
+                    {
+                        var oneTile = new Rectangle((int)pair.Key.X, (int)pair.Key.Y, 1, 1);
+                        if (pair.Value is Chest chest)
+                        {
+                            ContainerKind kind = chest.fridge.Value ? MiniFridgeKind : IsBigChest(chest) ? BigChestKind : ChestKind;
+                            Add(location, pair.Key, chest, label, kind, oneTile, string.IsNullOrWhiteSpace(chest.DisplayName) ? "Chest" : chest.DisplayName);
+                        }
+                        else if (pair.Value.QualifiedItemId == AutoGrabberId && pair.Value.heldObject.Value is Chest grabbed)
+                        {
+                            Add(location, pair.Key, grabbed, label, AutoGrabberKind, oneTile,
+                                string.IsNullOrWhiteSpace(pair.Value.DisplayName) ? "Auto-Grabber" : pair.Value.DisplayName);
+                        }
+                    }
+
+                    // the built-in fridge of a house: its tile is the lower half (the half the player clicks), the upper half is the tile above
+                    Chest? fridge = location.GetFridge();   // null where there is no (unlocked) kitchen fridge
+                    Point? fridgeTile = location.GetFridgePosition();
+                    if (fridge != null && fridgeTile is Point tile)
+                        Add(location, new Vector2(tile.X, tile.Y), fridge, label, FridgeKind, new Rectangle(tile.X, tile.Y - 1, 1, 2), "Fridge");
+
+                    // the storage chests of buildings: the Mill's output box, the Junimo Hut's bag ...
+                    foreach (Building building in location.buildings)
+                    {
+                        foreach (Chest storage in GetBuildingStorage(building))
+                        {
+                            ContainerKind kind = GetBuildingKind(building);
+                            var footprint = new Rectangle(building.tileX.Value, building.tileY.Value, Math.Max(1, building.tilesWide.Value), Math.Max(1, building.tilesHigh.Value));
+                            Add(location, new Vector2(footprint.X, footprint.Y), storage, label, kind, footprint, kind.Singular);
+                        }
+                    }
+
+                    // dressers (not fish tanks): their items, mirrored into a stand-in Chest
+                    foreach (Furniture furniture in location.furniture)
+                    {
+                        if (furniture is not StorageFurniture dresser || furniture is FishTankFurniture)
+                            continue;
+
+                        Chest proxy = GetDresserProxy(dresser);
+                        Rectangle box = dresser.GetBoundingBox();
+                        var footprint = new Rectangle(box.X / 64, box.Y / 64, Math.Max(1, (box.Width + 63) / 64), Math.Max(1, (box.Height + 63) / 64));
+                        Add(location, new Vector2(footprint.X, footprint.Y), proxy, label, DresserKind, footprint,
+                            string.IsNullOrWhiteSpace(dresser.DisplayName) ? "Dresser" : dresser.DisplayName);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Monitor.LogOnce($"Could not list every container of {location.NameOrUniqueName}: {ex.Message}", LogLevel.Trace);
+                }
+
+                foreach (var container in found)
+                    yield return container;
+            }
+        }
+
+        /// <summary>Every searchable container of every location (see GetAllContainers).</summary>
+        private IEnumerable<(GameLocation location, Vector2 position, Chest chest, string label)> GetAllContainers()
+        {
+            return GetAllContainers(GetAllLocations());
+        }
+
+        /// <summary>The qualified item id of the Auto-Grabber.</summary>
+        private const string AutoGrabberId = "(BC)165";
+
+        /// <summary>True for a big chest (Big Chest, Big Stone Chest): only these are "big chests" in a title.</summary>
+        private static bool IsBigChest(Chest chest)
+        {
+            string id = chest.ItemId ?? "";
+            return id.Equals("BigChest", StringComparison.OrdinalIgnoreCase) || id.Equals("BigStoneChest", StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// The chests of a building the player can open and take from: the ones its data marks as storage or as an output to collect (the Mill's box,
+        /// the Junimo Hut's bag), never an input (the Mill's hopper). A Junimo Hut's bag is also asked for directly, in case its data says nothing.
+        /// </summary>
+        private static IEnumerable<Chest> GetBuildingStorage(Building building)
+        {
+            var result = new List<Chest>();
+            var data = building.GetData();
+            if (data?.Chests != null)
+            {
+                foreach (var chestData in data.Chests)
+                {
+                    if (chestData == null || chestData.Type == StardewValley.GameData.Buildings.BuildingChestType.Load)
+                        continue;
+                    Chest? chest = building.GetBuildingChest(chestData.Id);
+                    if (chest != null && !result.Contains(chest))
+                        result.Add(chest);
+                }
+            }
+
+            if (building is JunimoHut hut && hut.GetOutputChest() is Chest bag && !result.Contains(bag))
+                result.Add(bag);
+
+            return result;
+        }
+
+        /// <summary>The kind of a building's storage: Mill, Junimo Hut, or (another mod's building) a kind named like the building.</summary>
+        private ContainerKind GetBuildingKind(Building building)
+        {
+            string type = building.buildingType.Value ?? "";
+            if (building is JunimoHut || type.Equals("Junimo Hut", StringComparison.OrdinalIgnoreCase))
+                return JunimoHutKind;
+            if (type.Equals("Mill", StringComparison.OrdinalIgnoreCase))
+                return MillKind;
+
+            if (!buildingKinds.TryGetValue(type, out ContainerKind? kind))
+            {
+                string name = type;
+                try
+                {
+                    string? dataName = building.GetData()?.Name;
+                    if (!string.IsNullOrWhiteSpace(dataName))
+                        name = TokenParser.ParseText(dataName);
+                }
+                catch (Exception)
+                {
+                    // keep the building type as its name
+                }
+
+                if (string.IsNullOrWhiteSpace(name))
+                    name = "Building";
+                buildingKinds[type] = kind = new ContainerKind("building:" + type, name, name + "s", name, true, 7);
+            }
+            return kind;
+        }
+
+        /// <summary>The stand-in Chest of a dresser, with the dresser's items copied in (the same item objects, nothing is moved or cloned).</summary>
+        private Chest GetDresserProxy(StorageFurniture dresser)
+        {
+            if (!dresserProxies.TryGetValue(dresser, out Chest? proxy))
+                dresserProxies[dresser] = proxy = new Chest(false);
+
+            proxy.Items.Clear();
+            foreach (Item? item in dresser.heldItems)
+            {
+                if (item != null)
+                    proxy.Items.Add(item);
+            }
+            return proxy;
+        }
+
+        /// <summary>The dresser a stand-in Chest belongs to (null for every real container).</summary>
+        private StorageFurniture? GetDresserOf(Chest chest)
+        {
+            foreach (var pair in dresserProxies)
+            {
+                if (ReferenceEquals(pair.Value, chest))
+                    return pair.Key;
+            }
+            return null;
+        }
+
+        /// <summary>The items a container holds right now (a dresser's stand-in is refreshed from the dresser first).</summary>
+        private IEnumerable<Item> CurrentItems(Chest chest)
+        {
+            StorageFurniture? dresser = GetDresserOf(chest);
+            if (dresser != null)
+                GetDresserProxy(dresser);
+            return chest.Items.Where(i => i != null).Select(i => i!);
+        }
+
+        /// <summary>What is known about a container (a chest that was never listed counts as a plain one-tile chest at <paramref name="position"/>).</summary>
+        private ContainerInfo InfoOf(Chest chest, Vector2 position)
+        {
+            if (containerInfo.TryGetValue(chest, out ContainerInfo info))
+                return info;
+            return new ContainerInfo(ChestKind, new Rectangle((int)position.X, (int)position.Y, 1, 1), string.IsNullOrWhiteSpace(chest.DisplayName) ? "Chest" : chest.DisplayName);
+        }
+
+        /// <summary>The kind of a container (plain chest if it was never listed).</summary>
+        private ContainerKind KindOf(Chest chest)
+        {
+            return containerInfo.TryGetValue(chest, out ContainerInfo info) ? info.Kind : ChestKind;
+        }
+
+        /// <summary>True for a fridge of any kind (built-in or mini-fridge).</summary>
+        private bool IsFridge(Chest chest)
+        {
+            return KindOf(chest).FamilyKind == FridgeKind;
+        }
+
+        /// <summary>
+        /// The ONE kind that names a set of kinds: the kind itself when there is one; the family when they are all of one family (a fridge and a
+        /// mini-fridge -> fridge); otherwise chest (every other mix, a chest and a big chest included).
+        /// </summary>
+        private static ContainerKind NamingKind(IEnumerable<ContainerKind> kinds)
+        {
+            var distinct = kinds.Distinct().ToList();
+            if (distinct.Count == 1)
+                return distinct[0];
+            var families = distinct.Select(k => k.FamilyKind).Distinct().ToList();
+            return distinct.Count > 1 && families.Count == 1 && families[0].IsSpecial ? families[0] : ChestKind;
+        }
+
+        /// <summary>
+        /// The word for a number of containers in a title or the status line: when ALL of them are of the same kind, that kind's word (singular for
+        /// one, plural for more: "fridge", "2 fridges", "mini-fridge", "Auto-Grabber", "big chests" only when every one is a big chest); fridges
+        /// and mini-fridges together are "fridges"; any other mix (a chest and a big chest included) simply "chest" / "chests".
+        /// </summary>
+        private string ContainerWord(IReadOnlyCollection<Chest> containers)
+        {
+            ContainerKind kind = containers.Count == 0 ? ChestKind : NamingKind(containers.Select(KindOf));
+            return containers.Count == 1 ? kind.Singular : kind.Plural;
+        }
+
+        /// <summary>The arrow's label word for the containers of one target: the arrow name of their naming kind ("Fridge", "Mini-Fridge", "Chest" ...).</summary>
+        private string ArrowWord(IEnumerable<Chest> containers)
+        {
+            var list = containers.ToList();
+            return list.Count == 0 ? ChestKind.ArrowName : NamingKind(list.Select(KindOf)).ArrowName;
+        }
+
+        /// <summary>The tiles a highlighted container covers (see ContainerInfo.Footprint).</summary>
+        private Rectangle FootprintOf(Chest chest, Vector2 position)
+        {
+            return InfoOf(chest, position).Footprint;
+        }
+
+        /// <summary>The same tiles in world pixels.</summary>
+        private Rectangle FootprintPixels(Chest chest, Vector2 position)
+        {
+            Rectangle tiles = FootprintOf(chest, position);
+            return new Rectangle(tiles.X * 64, tiles.Y * 64, tiles.Width * 64, tiles.Height * 64);
+        }
+
+        /// <summary>The middle of a container's footprint, as a tile position (what the arrow points at).</summary>
+        private Vector2 FootprintCenterTile(Chest chest, Vector2 position)
+        {
+            Rectangle tiles = FootprintOf(chest, position);
+            return new Vector2(tiles.X + tiles.Width / 2f - 0.5f, tiles.Y + tiles.Height / 2f - 0.5f);
+        }
+
+        // The display name of every item in every chest and fridge (same containers as ScanChests looks at).
         private IEnumerable<string> GetChestItemNames()
         {
-            foreach (var (location, _) in GetAllLocations())
+            foreach (var (_, _, chest, _) in GetAllContainers())
             {
-                foreach (var obj in location.objects.Pairs)
+                foreach (Item? item in chest.Items)
                 {
-                    if (obj.Value is not Chest chest)
-                        continue;
-
-                    foreach (Item? item in chest.Items)
-                    {
-                        if (item != null)
-                            yield return GetShownItemName(item);
-                    }
+                    if (item != null)
+                        yield return GetShownItemName(item);
                 }
             }
         }
 
         // The display name and stack size of every item in every chest (same chests as GetChestItemNames). The suggestion index adds the stacks up
         // per name, so "Did you mean" and the drop-down know which related item the player holds the most of.
+        /// <summary>
+        /// One real item of every name the chests hold (suggestion key -> a one-piece copy without star), for the icons of the drop-down: a held item is
+        /// drawn exactly as it lies in the chest, like the hover tips of the places and chests do. That is what gives a built item its colour
+        /// ("Apple Wine" is a red bottle, not the plain purple Wine): the game makes these from an ingredient, and only the real item knows it.
+        /// The same goes for jelly, juice, pickles, roe, honey, dried fruit, smoked fish, specific bait, dyed clothes and items of other mods.
+        /// </summary>
+        private Dictionary<string, Item> GetChestIconSamples()
+        {
+            var samples = new Dictionary<string, Item>(StringComparer.Ordinal);
+            foreach (var (_, _, chest, _) in GetAllContainers())
+            {
+                foreach (Item? item in CurrentItems(chest))
+                {
+                    if (item == null)
+                        continue;
+                    string key = SuggestionIndex.MakeKey(GetShownItemName(item));
+                    if (key.Length > 0 && !samples.ContainsKey(key))
+                        samples[key] = MakeIconSample(item);   // the first one found (two different items of one name, e.g. both Eggs: one of them, as before)
+                }
+            }
+            return samples;
+        }
+
         private IEnumerable<(string DisplayName, int Stack)> GetChestItemStacks()
         {
-            foreach (var (location, _) in GetAllLocations())
+            foreach (var (_, _, chest, _) in GetAllContainers())
             {
-                foreach (var obj in location.objects.Pairs)
+                foreach (Item? item in chest.Items)
                 {
-                    if (obj.Value is not Chest chest)
-                        continue;
-
-                    foreach (Item? item in chest.Items)
-                    {
-                        if (item != null)
-                            yield return (GetShownItemName(item), Math.Max(1, item.Stack));
-                    }
+                    if (item != null)
+                        yield return (GetShownItemName(item), Math.Max(1, item.Stack));
                 }
             }
         }
 
-        // Opening ANY chest that contains the target clears ALL highlights (unless "Keep highlights" is locked), and shows a small "Found 'Apple'!"
-        // note naming what THIS chest really holds of the search (see ShowFoundToast). Opening a chest that is not a target does nothing at all.
+        // Opening ANY container that contains the target clears ALL highlights (unless "Keep highlights" is locked), and shows a small "Found 'Apple'!"
+        // note naming what THIS container really holds of the search (see ShowFoundToast). Opening one that is not a target only shows the light
+        // "No target items here" note (if it really holds nothing of the search). Which container was opened:
+        //   - a chest / fridge / building chest opens the game's chest menu (ItemGrabMenu), usually with the container itself as its context;
+        //   - otherwise (an Auto-Grabber, a building ...) the tile the player clicked tells: the container whose footprint holds that tile;
+        //   - a dresser opens its own clothing menu (a ShopMenu whose source is the dresser).
         private void OnMenuChanged(object? sender, MenuChangedEventArgs e)
         {
             if (highlightedChests.Count == 0) return;
-            if (e.NewMenu is not ItemGrabMenu menu) return;
 
-            Chest? openedChest = null;
-            if (menu.context is Chest opened)
+            Chest? opened = null;
+            if (e.NewMenu is ShopMenu shop && shop.source is StorageFurniture dresser)
             {
-                if (highlightedChests.Any(h => ReferenceEquals(h.chest, opened)))
-                    openedChest = opened;
+                opened = dresserProxies.TryGetValue(dresser, out Chest? proxy) ? proxy : GetDresserProxy(dresser);
             }
-            else
+            else if (e.NewMenu is ItemGrabMenu menu)
             {
-                foreach (var (location, position, chest) in highlightedChests)
-                {
-                    if (location == Game1.currentLocation && position == lastGrabTile)
-                    {
-                        openedChest = chest;
-                        break;
-                    }
-                }
+                if (menu.context is Chest context && (containerInfo.ContainsKey(context) || highlightedChests.Any(h => ReferenceEquals(h.chest, context))))
+                    opened = context;
+                else
+                    opened = FindContainerAtTile(Game1.currentLocation, lastGrabTile);
             }
 
-            if (openedChest == null)
+            if (opened == null)
+                return;   // not one of the containers the search looks into (a shipping bin, a fishing treasure ...)
+
+            bool isTarget = highlightedChests.Any(h => ReferenceEquals(h.chest, opened));
+            if (!isTarget)
             {
-                // not a target: a short grey "No target items here" in the lower left corner, if this chest really holds nothing of the search
-                // (a chest that got a matching item after the search is not "empty-handed": then no note). The highlights stay.
-                if (menu.context is Chest plain && plain.playerChest.Value)
+                // not a target: a short grey "No target items here" in the lower left corner, if it really holds nothing of the search (a container
+                // that got a matching item after the search is not "empty-handed": then no note). The highlights stay.
+                Func<Item, bool>? matcher = highlightMatcher;
+                bool holdsTarget = matcher != null && CurrentItems(opened).Any(i => matcher(i));
+                if (!holdsTarget)
                 {
-                    Func<Item, bool>? matcher = highlightMatcher;
-                    bool holdsTarget = matcher != null && plain.Items != null && plain.Items.Any(i => i != null && matcher(i));
-                    if (!holdsTarget)
-                    {
-                        ShowLightNote("No target items here");
-                        // the soft "invalid" blip, a moment AFTER the chest's own opening sound (played in the same frame, it would be drowned out);
-                        // queued like the second sound of a successful search, so the open chest menu cannot swallow it
-                        pendingSounds.Add((NoTargetSound, clock.ElapsedMilliseconds + NoTargetSoundDelayMs));
-                    }
+                    ShowLightNote("No target items here");
+                    // the soft "invalid" blip, a moment AFTER the container's own opening sound (played in the same frame, it would be drowned out);
+                    // queued like the second sound of a successful search, so the open menu cannot swallow it
+                    pendingSounds.Add((NoTargetSound, clock.ElapsedMilliseconds + NoTargetSoundDelayMs));
                 }
                 return;
             }
 
-            ShowFoundToast(openedChest);   // also while the highlights are locked: the note only confirms, it changes nothing
+            ShowFoundToast(opened);   // also while the highlights are locked: the note only confirms, it changes nothing
 
-            if (IsKeepHighlightsLocked) return;   // locked ("Keep highlights" checked): opening chests never clears the highlights
+            // whether something was taken out cannot be told (one item, a stack, taken and put back ...), so OPENING decides:
+            //   not locked: the search did its job, every highlight goes;
+            //   locked ("Keep highlights" checked, the player is collecting from several containers): only THIS container's highlight goes, the others
+            //   stay and the arrow turns to the next nearest one. Unchecking "Keep highlights" clears the rest at any time.
+            if (IsKeepHighlightsLocked)
+            {
+                highlightedChests.RemoveAll(h => ReferenceEquals(h.chest, opened));
+                if (highlightedChests.Count == 0)
+                    ClearHighlights();   // that was the last one
+                return;
+            }
             ClearHighlights();
+        }
+
+        /// <summary>
+        /// The container whose footprint holds this tile of the location: first among the highlighted ones (they are known), else among all
+        /// containers of the location (only listed when needed: a menu was opened and its context did not say which container it belongs to).
+        /// </summary>
+        private Chest? FindContainerAtTile(GameLocation? location, Vector2 tile)
+        {
+            if (location == null)
+                return null;
+
+            var point = new Point((int)tile.X, (int)tile.Y);
+            foreach (var (place, position, chest) in highlightedChests)
+            {
+                if (place == location && FootprintOf(chest, position).Contains(point))
+                    return chest;
+            }
+
+            string label = GetAllLocations().FirstOrDefault(l => l.location == location).label ?? "";
+            foreach (var (_, position, chest, _) in GetAllContainers(new[] { (location, label) }))
+            {
+                if (FootprintOf(chest, position).Contains(point))
+                    return chest;
+            }
+            return null;
         }
 
         // ===================== "FOUND" NOTE WHEN A TARGET CHEST IS OPENED =====================
@@ -646,9 +1049,8 @@ namespace ChestItemFinder
         /// <summary>The game's sound cue of the note: a soft confirmation that the item was SEEN, not taken. Change it here (any cue name of the game; "drumkit6" is a softer alternative).</summary>
         private const string FoundToastSound = "smallSelect";   // a soft UI tick, like a radar "ping": nothing like picking an item up (coin / pickUpItem)
 
-        private List<(string Name, int Count, bool Star)> foundToastItems = new();
+        private List<(string Name, int Count, int Star)> foundToastItems = new();   // Star: the quality whose star is drawn in front (only 1 / 2 / 4 draw one)
         private int foundToastMore;      // how many more names there are than shown ("and 2 more")
-        private int foundToastQuality;   // the star drawn in front of the starred items (only 1 / 2 / 4 draw one)
         private long foundToastUntilMs;
 
         private void ShowFoundToast(Chest chest)
@@ -656,20 +1058,20 @@ namespace ChestItemFinder
             try
             {
                 Func<Item, bool>? matcher = highlightMatcher;
-                if (matcher == null || chest.Items == null)
+                if (matcher == null)
                     return;
 
                 // name -> (count, can it carry a star), in the order the chest holds them
                 var counts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
                 var starCapable = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
                 var order = new List<string>();
-                foreach (Item? item in chest.Items)
+                foreach (Item item in CurrentItems(chest))   // a dresser: its items right now
                 {
-                    if (item == null || !matcher(item))
+                    if (!matcher(item))
                         continue;
-                    string name = GetShownItemName(item);
-                    if (string.IsNullOrWhiteSpace(name))
+                    if (string.IsNullOrWhiteSpace(GetShownItemName(item)))
                         continue;
+                    string name = RowKey(item);   // the item name, or name + quality (see ONE ROW PER QUALITY)
                     if (!counts.ContainsKey(name))
                     {
                         order.Add(name);
@@ -690,12 +1092,16 @@ namespace ChestItemFinder
                     ? order.Where(n => starCapable[n]).Concat(order.Where(n => !starCapable[n])).ToList()
                     : order;
 
+                // one row per quality: every quality of the item gets its own entry with its own star, plain to iridium (at most four, all shown)
+                if (singleItemQualityRows)
+                    ordered = ordered.OrderBy(QualityRowOrder).ToList();
+                int maxNames = singleItemQualityRows ? Math.Max(FoundToastMaxNames, 4) : FoundToastMaxNames;
+
                 foundToastItems = ordered
-                    .Take(FoundToastMaxNames)
-                    .Select(n => (n, counts[n], starFilter && starCapable[n]))
+                    .Take(maxNames)
+                    .Select(n => (RowName(n), counts[n], singleItemQualityRows ? RowQuality(n) : (starFilter && starCapable[n] ? resultQuality : 0)))
                     .ToList();
                 foundToastMore = ordered.Count - foundToastItems.Count;
-                foundToastQuality = resultQuality;
                 foundToastUntilMs = clock.ElapsedMilliseconds + FoundToastMs;
                 Game1.playSound(FoundToastSound);
             }
@@ -772,7 +1178,7 @@ namespace ChestItemFinder
         private string HighlightStatusText()
         {
             int count = highlightedChests.Count;
-            return $"Highlighting: {highlightLabel} ({count} {(count == 1 ? "chest" : "chests")})";
+            return $"Highlighting: {highlightLabel} ({count} {ContainerWord(highlightedChests.Select(h => h.chest).ToList())})";
         }
 
         /// <summary>Where the notes above the status line end (their bottom edge): just above the status line while it shows, else the corner bottom.</summary>
@@ -863,8 +1269,8 @@ namespace ChestItemFinder
                     var (name, count, star) = foundToastItems[i];
                     if (i > 0)
                         pieces.Add((", ", 0));
-                    if (star)
-                        pieces.Add((null, foundToastQuality));
+                    if (SearchMenu.HasStarSprite(star))
+                        pieces.Add((null, star));
                     pieces.Add(($"'{name}' {times}{count}", 0));
                 }
                 if (foundToastMore > 0)
@@ -907,12 +1313,13 @@ namespace ChestItemFinder
         // A red arrow with a black outline and a small "Chest" label (white letters, black edge), so it reads on every ground, also dark floors.
         // It does not flash. It lives exactly as long as the highlights: it goes away when they expire on their own (the countdown), and stays as long
         // as "Keep highlights" keeps them. No arrow while a menu, an event or a hidden HUD is up.
-        //   - Highlighted chests in THIS location: while none of them is on screen, the arrow sits at the edge of the screen on the line from the screen
-        //     center to the nearest of them (nearest to the player) and points at it; as soon as one is on screen it disappears (the flash shows the way).
-        //   - Highlighted chests only in OTHER locations: the arrow shows the way out. The locations are linked by their warps, doors and building
-        //     doors; the route with the fewest location changes to a location with a highlighted chest wins (ties: the exit nearest to the player), and
-        //     the arrow points at the exit of THIS location that starts that route (at the screen edge while the exit is off screen, right above it,
-        //     pointing down, while it is on screen). The label names the place: "Chest: Farm".
+        //   - The arrow always shows the way to the NEAREST target, measured like the order of the place list (see WALKING DISTANCE): a chest in this
+        //     location by its tiles, a container behind a door (a barn, a house ...) by the walk to that door plus the way inside.
+        //   - The nearest target is in THIS location: while none of the highlighted containers here is on screen, the arrow sits at the edge of the
+        //     screen on the line from the screen center to it and points at it; as soon as one is on screen it disappears (the flash shows the way).
+        //   - The nearest target is behind a door / in another location: the arrow points at the exit of THIS location that starts the way there (at
+        //     the screen edge while the exit is off screen, right above it, pointing down, while it is on screen), even when highlighted chests of this
+        //     location are on screen: standing at the barn door, the arrow says "Auto-Grabber: Deluxe Barn". The label names the place.
         //   - No route at all (Ginger Island needs the boat, a cave needs the elevator ...): the arrow sits at the top of the screen with the label
         //     "Chest: Ginger Island", so the player still knows where the chests are.
 
@@ -947,6 +1354,12 @@ namespace ChestItemFinder
         private int edgeRouteChestCount = -1;
         private Point? edgeRouteExit;
         private string edgeRouteLabel = "";
+        private string edgeRouteWord = "Chest";   // the kind of the route target's containers ("Fridge", "Auto-Grabber" ...) if they are all one kind
+        private float edgeRouteCost = float.MaxValue;   // the walking distance of that target (see WALKING DISTANCE), to compare with the targets here
+
+        /// <summary>The tick in which the item list of a hovered place was last drawn, and where it was (the arrow hides only if it would lie on it).</summary>
+        private int placeTooltipShownTick = -1;
+        private Rectangle placeTooltipBounds;
 
         private void OnRenderedHudEdgeArrow(object? sender, RenderedHudEventArgs e)
         {
@@ -974,43 +1387,49 @@ namespace ChestItemFinder
 
                 var view = new Rectangle(Game1.viewport.X, Game1.viewport.Y, Game1.viewport.Width, Game1.viewport.Height);   // world pixels on screen
                 bool anyHere = false;
+                bool anyHereOnScreen = false;
                 Vector2? nearest = null;
+                Chest? nearestChest = null;
                 float nearestDistance = float.MaxValue;
-                foreach (var (location, position, _) in highlightedChests)
+                foreach (var (location, position, chest) in highlightedChests)
                 {
                     if (location != here)
                         continue;
                     anyHere = true;
 
-                    var tile = new Rectangle((int)position.X * 64, (int)position.Y * 64, 64, 64);
-                    if (view.Intersects(tile))
-                        return;   // one of them is on screen: its flash shows the way
+                    if (view.Intersects(FootprintPixels(chest, position)))
+                        anyHereOnScreen = true;   // one of them is on screen (any part of a fridge, a building ...): its flash shows the way
 
-                    float distance = Vector2.DistanceSquared(position, player.Tile);
+                    float distance = Vector2.Distance(position, player.Tile);
                     if (distance < nearestDistance)
                     {
                         nearestDistance = distance;
                         nearest = position;
+                        nearestChest = chest;
                     }
                 }
 
-                if (anyHere)
-                {
-                    if (nearest is Vector2 target)
-                        DrawEdgeArrowTowards(e.SpriteBatch, target, "Chest");
-                    return;
-                }
-
-                // every highlighted chest is in another location: the way out of this one
+                // the nearest target in ANOTHER location (behind a door ...): worked out again now and then, or at once on a new location / highlight set
                 if (!ReferenceEquals(edgeRouteFrom, here) || edgeRouteChestCount != highlightedChests.Count || Game1.ticks - edgeRouteTick >= EdgeRouteRefreshTicks)
                 {
                     edgeRouteFrom = here;
                     edgeRouteChestCount = highlightedChests.Count;
                     edgeRouteTick = Game1.ticks;
-                    (edgeRouteExit, edgeRouteLabel) = FindRouteToNearestChest(here, player.Tile);
+                    (edgeRouteExit, edgeRouteLabel, GameLocation? routeTarget, edgeRouteCost) = FindRouteToNearestChest(here, player.Tile);
+
+                    // "Fridge: Farmhouse" when everything highlighted there is a fridge, "Auto-Grabber: Barn" ..., else "Chest: Farm"
+                    edgeRouteWord = ArrowWord(highlightedChests.Where(h => h.location == routeTarget).Select(h => h.chest));
                 }
 
-                string label = edgeRouteLabel.Length > 0 ? "Chest: " + edgeRouteLabel : "Chest";
+                bool routeIsNearer = edgeRouteExit != null && (!anyHere || edgeRouteCost < nearestDistance);
+                if (anyHere && !routeIsNearer)
+                {
+                    if (!anyHereOnScreen && nearest is Vector2 target && nearestChest != null)
+                        DrawEdgeArrowTowards(e.SpriteBatch, FootprintCenterTile(nearestChest, target), KindOf(nearestChest).ArrowName);   // "Fridge", "Auto-Grabber", "Chest" ...
+                    return;
+                }
+
+                string label = edgeRouteLabel.Length > 0 ? edgeRouteWord + ": " + edgeRouteLabel : edgeRouteWord;
                 if (edgeRouteExit is Point exit)
                 {
                     var exitTile = new Rectangle(exit.X * 64, exit.Y * 64, 64, 64);
@@ -1033,83 +1452,196 @@ namespace ChestItemFinder
         }
 
         /// <summary>
-        /// The exit of <paramref name="here"/> that starts the shortest walk (fewest location changes) to a location with a highlighted chest, and the
-        /// place name of that location. Exit null = no location with a highlighted chest can be reached through warps and doors (the label then still
-        /// names the place of the first highlighted chest).
+        /// The nearest highlighted container in ANOTHER location (by WALKING DISTANCE), the exit of <paramref name="here"/> that starts the way there,
+        /// the place name of its location and its walking distance. Exit null = no highlighted container elsewhere can be reached on foot (the label
+        /// then still names the place of the first one; the distance is float.MaxValue).
         /// </summary>
-        private (Point? Exit, string Label) FindRouteToNearestChest(GameLocation here, Vector2 playerTile)
+        private (Point? Exit, string Label, GameLocation? Target, float Cost) FindRouteToNearestChest(GameLocation here, Vector2 playerTile)
         {
-            // every location by its name (building interiors by their unique name), with the place label of the result panel
-            var byName = new Dictionary<string, (GameLocation Location, string Label)>(StringComparer.OrdinalIgnoreCase);
-            foreach (var (location, label) in GetAllLocations())
-            {
-                byName.TryAdd(location.NameOrUniqueName, (location, label));
-                byName.TryAdd(location.Name, (location, label));
-            }
+            ExitGraph graph = GetExitGraph();
+            var reach = ComputeReach(graph, here, playerTile);
 
-            var targets = new HashSet<GameLocation>(highlightedChests.Select(h => h.location));
-            string LabelOf(GameLocation location) => byName.TryGetValue(location.NameOrUniqueName, out var entry) ? entry.Label : GetFriendlyName(location.Name);
-
-            // breadth first, one location change per level; every location remembers the exit of HERE its route started with
-            var visited = new HashSet<GameLocation> { here };
-            var level = new List<(GameLocation Location, Point FirstExit)>();
-            foreach (var (exit, to) in GetLocationExits(here, byName))
+            GameLocation? best = null;
+            float bestCost = float.MaxValue;
+            foreach (var (location, position, _) in highlightedChests)
             {
-                if (visited.Add(to))
-                    level.Add((to, exit));
-            }
-
-            while (level.Count > 0)
-            {
-                // the nearest exit (to the player) among the routes that reach a chest at this level
-                var reached = level.Where(l => targets.Contains(l.Location)).ToList();
-                if (reached.Count > 0)
+                if (location == here || !reach.TryGetValue(location, out var way))
+                    continue;
+                float cost = way.Cost + (way.Arrival is Vector2 arrival ? Vector2.Distance(arrival, position) : 0f);
+                if (cost < bestCost)
                 {
-                    var best = reached.OrderBy(r => Vector2.DistanceSquared(new Vector2(r.FirstExit.X, r.FirstExit.Y), playerTile)).First();
-                    return (best.FirstExit, LabelOf(best.Location));
+                    bestCost = cost;
+                    best = location;
                 }
-
-                var next = new List<(GameLocation Location, Point FirstExit)>();
-                foreach (var (location, firstExit) in level)
-                {
-                    foreach (var (_, to) in GetLocationExits(location, byName))
-                    {
-                        if (visited.Add(to))
-                            next.Add((to, firstExit));
-                    }
-                }
-                level = next;
             }
 
-            GameLocation? anyTarget = highlightedChests.Count > 0 ? highlightedChests[0].location : null;
-            return (null, anyTarget != null ? LabelOf(anyTarget) : "");
+            string LabelOf(GameLocation location) => graph.Labels.TryGetValue(location, out string? label) ? label : GetFriendlyName(location.Name);
+
+            if (best != null)
+                return (reach[best].FirstExit, LabelOf(best), best, bestCost);
+
+            GameLocation? anyTarget = highlightedChests.Select(h => h.location).FirstOrDefault(l => l != here);
+            return (null, anyTarget != null ? LabelOf(anyTarget) : "", anyTarget, float.MaxValue);
         }
 
-        /// <summary>The ways out of a location: its warps (map edges, cave mouths ...), its doors (houses, shops) and the doors of its buildings (barns, sheds, the farmhouse).</summary>
-        private static IEnumerable<(Point Exit, GameLocation To)> GetLocationExits(GameLocation location, Dictionary<string, (GameLocation Location, string Label)> byName)
+        // ===================== WALKING DISTANCE (order of the place list AND the target of the arrow) =====================
+        // How far a container is from the player, roughly in tiles walked:
+        //   - in the player's location: the straight distance between the two tiles;
+        //   - in another location: the walk to the exit (door, map edge ...) that starts the way there, plus WalkingHopCost for every location
+        //     change, plus the walks inside the locations on the way (from where the player comes in to the next exit), plus the walk from where the
+        //     player comes into the last location to the container. Standing at a barn door, the Auto-Grabber inside is a few tiles away, nearer than a
+        //     chest at the other end of the farm.
+        //   - a location that cannot be reached on foot (Ginger Island needs the boat ...): after every reachable one, in the old rough order of map
+        //     weights (see GetMapWeight).
+        // The ways between locations (ExitGraph): their warps (map edges, cave mouths), their doors, the doors of their buildings, and, for a door the
+        // game handles in its own way (the Ginger Island farmhouse ...), the way back: a location B whose warp leads to A at a tile has a door in A
+        // right there. Where somebody arrives after a door is taken from the warp that leads back.
+
+        /// <summary>What one location change costs, in tiles (going through a door is a little more than walking past it).</summary>
+        private const float WalkingHopCost = 5f;
+
+        /// <summary>The sort key of a place that cannot be reached on foot starts here (every reachable place is nearer).</summary>
+        private const float UnreachableDistance = 1_000_000f;
+
+        /// <summary>The ways out of every location (see WALKING DISTANCE), and the place label of every location.</summary>
+        private sealed class ExitGraph
         {
-            var exits = new List<(Point, GameLocation)>();
+            public readonly Dictionary<GameLocation, List<(Point Exit, GameLocation To, Vector2? Arrival)>> Exits = new(ReferenceEqualityComparer.Instance);
+            public readonly Dictionary<GameLocation, string> Labels = new(ReferenceEqualityComparer.Instance);
+            public readonly Dictionary<string, GameLocation> ByName = new(StringComparer.OrdinalIgnoreCase);
+        }
 
-            foreach (Warp warp in location.warps)
+        private ExitGraph? exitGraph;
+        private int exitGraphTick = int.MinValue;
+
+        /// <summary>How long a worked-out exit graph is used before it is worked out again (game ticks): buildings can be built or moved.</summary>
+        private const int ExitGraphRefreshTicks = 600;
+
+        /// <summary>The ways between all locations (worked out again now and then, see ExitGraphRefreshTicks).</summary>
+        private ExitGraph GetExitGraph()
+        {
+            if (exitGraph != null && Game1.ticks - exitGraphTick < ExitGraphRefreshTicks && Game1.ticks >= exitGraphTick)
+                return exitGraph;
+
+            var graph = new ExitGraph();
+            foreach (var (location, label) in GetAllLocations())
             {
-                if (warp != null && !string.IsNullOrEmpty(warp.TargetName) && byName.TryGetValue(warp.TargetName, out var target))
-                    exits.Add((new Point(warp.X, warp.Y), target.Location));
+                graph.ByName.TryAdd(location.NameOrUniqueName, location);
+                graph.ByName.TryAdd(location.Name, location);
+                graph.Labels.TryAdd(location, label);
+                graph.Exits.TryAdd(location, new List<(Point, GameLocation, Vector2?)>());
             }
 
-            foreach (KeyValuePair<Point, string> door in location.doors.Pairs)
+            foreach (var (location, exits) in graph.Exits)
+                exits.AddRange(ReadExits(graph, location));
+
+            // the way back: B's warp leads to A at a tile, so A has a door to B right there (if A knows no way to B yet). Arrival points that are
+            // still unknown (doors, building doors) come from the warp that leads back
+            foreach (var (location, exits) in graph.Exits)
             {
-                if (!string.IsNullOrEmpty(door.Value) && byName.TryGetValue(door.Value, out var target))
-                    exits.Add((door.Key, target.Location));
+                foreach (var (warpTile, to, arrival) in exits.ToList())
+                {
+                    if (arrival is not Vector2 at || !graph.Exits.TryGetValue(to, out var back))
+                        continue;
+                    if (!back.Any(x => ReferenceEquals(x.To, location)))
+                        back.Add((new Point((int)at.X, (int)at.Y), location, new Vector2(warpTile.X, warpTile.Y)));
+                }
+            }
+            foreach (var (location, exits) in graph.Exits)
+            {
+                for (int i = 0; i < exits.Count; i++)
+                {
+                    var (exit, to, arrival) = exits[i];
+                    if (arrival != null || !graph.Exits.TryGetValue(to, out var back))
+                        continue;
+                    foreach (var (backExit, backTo, _) in back)
+                    {
+                        if (ReferenceEquals(backTo, location))
+                        {
+                            exits[i] = (exit, to, new Vector2(backExit.X, backExit.Y));   // comes in next to the door that leads back
+                            break;
+                        }
+                    }
+                }
             }
 
-            foreach (var building in location.buildings)
-            {
-                GameLocation? indoors = building.indoors.Value;
-                if (indoors != null)
-                    exits.Add((new Point(building.tileX.Value + building.humanDoor.X, building.tileY.Value + building.humanDoor.Y), indoors));
-            }
+            exitGraph = graph;
+            exitGraphTick = Game1.ticks;
+            return graph;
+        }
 
+        /// <summary>The ways out of one location: its warps (with where they arrive), its doors and the doors of its buildings.</summary>
+        private List<(Point Exit, GameLocation To, Vector2? Arrival)> ReadExits(ExitGraph graph, GameLocation location)
+        {
+            var exits = new List<(Point Exit, GameLocation To, Vector2? Arrival)>();
+            try
+            {
+                foreach (Warp warp in location.warps)
+                {
+                    if (warp != null && !string.IsNullOrEmpty(warp.TargetName) && graph.ByName.TryGetValue(warp.TargetName, out GameLocation? to))
+                        exits.Add((new Point(warp.X, warp.Y), to, new Vector2(warp.TargetX, warp.TargetY)));
+                }
+
+                foreach (KeyValuePair<Point, string> door in location.doors.Pairs)
+                {
+                    if (!string.IsNullOrEmpty(door.Value) && graph.ByName.TryGetValue(door.Value, out GameLocation? to))
+                        exits.Add((door.Key, to, null));
+                }
+
+                foreach (var building in location.buildings)
+                {
+                    GameLocation? indoors = building.indoors.Value;
+                    if (indoors != null)
+                        exits.Add((new Point(building.tileX.Value + building.humanDoor.X, building.tileY.Value + building.humanDoor.Y), indoors, null));
+                }
+            }
+            catch (Exception ex)
+            {
+                Monitor.LogOnce($"Could not read the exits of {location.NameOrUniqueName}: {ex.Message}", LogLevel.Trace);
+            }
             return exits;
+        }
+
+        /// <summary>
+        /// Every location that can be reached on foot from <paramref name="here"/>: its walking distance (to where the player comes in), where the
+        /// player comes in (null = unknown) and the exit of <paramref name="here"/> that starts the way.
+        /// </summary>
+        private Dictionary<GameLocation, (float Cost, Vector2? Arrival, Point FirstExit)> ComputeReach(ExitGraph graph, GameLocation here, Vector2 playerTile)
+        {
+            // a location that is not in the list of searched locations (a mine level ...) still has its ways out
+            List<(Point Exit, GameLocation To, Vector2? Arrival)>? hereExits = graph.Exits.TryGetValue(here, out var listed) ? listed : ReadExits(graph, here);
+
+            var best = new Dictionary<GameLocation, (float Cost, Vector2? Arrival, Point FirstExit)>(ReferenceEqualityComparer.Instance);
+            var done = new HashSet<GameLocation>(ReferenceEqualityComparer.Instance);
+            var queue = new PriorityQueue<GameLocation, float>();
+
+            best[here] = (0f, playerTile, Point.Zero);
+            queue.Enqueue(here, 0f);
+            while (queue.TryDequeue(out GameLocation? location, out float cost))
+            {
+                if (!done.Add(location))
+                    continue;
+                var exits = ReferenceEquals(location, here) ? hereExits : graph.Exits.TryGetValue(location, out var more) ? more : null;
+                if (exits == null)
+                    continue;
+                var (_, arrival, firstExit) = best[location];
+
+                foreach (var (exit, to, toArrival) in exits)
+                {
+                    if (done.Contains(to))
+                        continue;
+                    float walk = arrival is Vector2 from ? Vector2.Distance(from, new Vector2(exit.X, exit.Y)) : 0f;
+                    float next = cost + walk + WalkingHopCost;
+                    if (!best.TryGetValue(to, out var known) || next < known.Cost)
+                    {
+                        best[to] = (next, toArrival, ReferenceEquals(location, here) ? exit : firstExit);
+                        queue.Enqueue(to, next);
+                    }
+                }
+            }
+
+            best.Remove(here);
+            return best;
         }
 
         /// <summary>The arrow at the screen edge, on the line from the screen center to a tile of the current location, pointing at it (the old placement).</summary>
@@ -1326,6 +1858,17 @@ namespace ChestItemFinder
             edgeArrowShiftTick = Game1.ticks;
             position = plain + edgeArrowShownShift;
 
+            // the item list of a hovered place (the mouse is on a place word of the panel) lies where arrow or label would be: both stay away while
+            // the list is up. The list changes size with every place and comes and goes as the mouse moves, so moving the arrow around it would only
+            // jump. Where they do not meet, the arrow stays as it is.
+            if (placeTooltipShownTick == Game1.ticks)
+            {
+                Rectangle list = placeTooltipBounds;
+                list.Inflate(EdgeArrowSpacing, EdgeArrowSpacing);
+                if (GroupBox(position).Intersects(list))
+                    return;
+            }
+
             b.Draw(arrow, position, null, Color.White, angle, new Vector2(arrow.Width / 2f, arrow.Height / 2f), EdgeArrowScale, SpriteEffects.None, 1f);
 
             if (labelWidth == 0)
@@ -1502,14 +2045,16 @@ namespace ChestItemFinder
         // Ginger Island areas are shown as compact compass letters, e.g. "Ginger Island (E, W x2)".
         private static readonly Dictionary<string, string> IslandAreaCodes = new()
         {
-            ["IslandNorth"] = "N",
-            ["IslandEast"] = "E",
-            ["IslandSouth"] = "S",
-            ["IslandSouthEast"] = "SE",
-            ["IslandWest"] = "W"
+            // the names players know (the Parrot Express stops: Docks, Farm, Dig Site, Jungle), not N / S / E / W. An area is only ever listed when a
+            // container was found there, so a place no chest can stand on (the volcano ...) never shows up
+            ["IslandNorth"] = "Dig Site",
+            ["IslandEast"] = "Jungle",
+            ["IslandSouth"] = "Docks",
+            ["IslandSouthEast"] = "Tide Pool",
+            ["IslandWest"] = "Farm"
         };
 
-        private static readonly string[] IslandAreaOrder = { "N", "E", "SE", "S", "W" };
+        private static readonly string[] IslandAreaOrder = { "Dig Site", "Jungle", "Tide Pool", "Docks", "Farm" };
 
         // Returns the island area label for a Ginger Island location, or null for any other location.
         private static string? GetIslandArea(string internalName)
@@ -1530,10 +2075,13 @@ namespace ChestItemFinder
 
         // The places of the panel, nearest to the player first. The distances come from ScanChests (GetPlaceSortKey): a place is as far as its nearest
         // matching chest. Places with the same distance (or without one) keep the order the chests were found in. Ginger Island is ONE entry,
-        // "Ginger Island (S, W x2)", sorted by its nearest area, so it is last unless the player is on the island; inside it the areas are
-        // nearest first too, then in their usual order (N, E, SE, S, W).
+        // "Ginger Island (Docks, Farm x2)", sorted by its nearest area, so it is last unless the player is on the island; inside it the areas are
+        // nearest first too, then in their usual order (Dig Site, Jungle, Tide Pool, Docks, Farm).
+        // noteOf / islandNoteOf: the note of a place / of an island area ("fridge", "Auto-Grabbers", see PlaceNote): "Farmhouse (fridge)",
+        // "Barn x2 (Auto-Grabbers)", and on the island right after the area: "Ginger Island (Farm, Farmhouse: fridge)". Most places get none.
         private static string BuildPlaceSummary(Dictionary<string, int> mainCounts, Dictionary<string, int> islandCounts,
-            Dictionary<string, float>? mainDistances = null, Dictionary<string, float>? islandDistances = null)
+            Dictionary<string, float>? mainDistances = null, Dictionary<string, float>? islandDistances = null,
+            Func<string, string>? noteOf = null, Func<string, string>? islandNoteOf = null)
         {
             float DistanceOf(Dictionary<string, float>? distances, string key)
             {
@@ -1544,7 +2092,11 @@ namespace ChestItemFinder
             int order = 0;
 
             foreach (var pair in mainCounts)
-                parts.Add((DistanceOf(mainDistances, pair.Key), order++, FormatCount(pair.Key, pair.Value)));
+            {
+                string note = noteOf?.Invoke(pair.Key) ?? "";
+                string text = FormatCount(pair.Key, pair.Value) + (note.Length > 0 ? " (" + note + ")" : "");
+                parts.Add((DistanceOf(mainDistances, pair.Key), order++, text));
+            }
 
             if (islandCounts.Count > 0)
             {
@@ -1553,7 +2105,11 @@ namespace ChestItemFinder
                     .ThenBy(p => { int i = Array.IndexOf(IslandAreaOrder, p.Key); return i < 0 ? IslandAreaOrder.Length : i; })
                     .ThenBy(p => p.Key)
                     .ToList();
-                var areas = orderedAreas.Select(p => FormatCount(p.Key, p.Value));
+                var areas = orderedAreas.Select(p =>
+                {
+                    string note = islandNoteOf?.Invoke(p.Key) ?? "";
+                    return FormatCount(p.Key, p.Value) + (note.Length > 0 ? ": " + note : "");
+                });
                 float nearestArea = orderedAreas.Min(p => DistanceOf(islandDistances, p.Key));
                 parts.Add((nearestArea, order++, "Ginger Island (" + string.Join(", ", areas) + ")"));
             }
@@ -1562,10 +2118,9 @@ namespace ChestItemFinder
         }
 
         // ===================== DISTANCE OF A PLACE FROM THE PLAYER (order of the places in the result panel) =====================
-        // The sort key of one chest, smaller = nearer:
-        //   - same map as the player:        the real distance between the two tiles (0 to a few hundred), so the chests next to you come first
-        //   - any other map:                 1000 + how far its map weight is from the weight of the map the player stands in
-        // The map weights below are a rough "walking distance from the farm", so the places of other maps are in a sensible order from wherever the
+        // The sort key of one chest, smaller = nearer: its WALKING DISTANCE (the same distance the arrow uses: a barn whose door is next to the
+        // player comes before a chest at the other end of the farm). Only a place that cannot be reached on foot falls back to the map weights below,
+        // after every reachable place. The map weights are a rough "walking distance from the farm", so such places are in a sensible order from wherever the
         // player is: standing on the farm, the order is Farm buildings, Backwoods, Bus Stop, Cindersap Forest, Town, Mountain, Beach, Railroad, Mines,
         // Desert, unknown maps and Ginger Island last; standing in town, the Bus Stop and the Forest come before the farm. A map of another mod
         // that has no weight counts as UnknownMapWeight. Every Ginger Island map weighs IslandWeight, so the island is the farthest of all; a player
@@ -1607,12 +2162,18 @@ namespace ChestItemFinder
             return UnknownMapWeight;
         }
 
-        private static float GetPlaceSortKey(GameLocation location, Vector2 chestTile, GameLocation? playerLocation, Vector2 playerTile, int playerMapWeight)
+        // The sort key of one container: its WALKING DISTANCE (see there) when it can be reached on foot; otherwise after every reachable one, in the
+        // order of the map weights above. reach = ComputeReach for the player's location (null: no player location, only the weights count).
+        private static float GetPlaceSortKey(GameLocation location, Vector2 chestTile, GameLocation? playerLocation, Vector2 playerTile, int playerMapWeight,
+            Dictionary<GameLocation, (float Cost, Vector2? Arrival, Point FirstExit)>? reach)
         {
             if (ReferenceEquals(location, playerLocation))
                 return Vector2.Distance(chestTile, playerTile);
 
-            return 1000f + Math.Abs(GetMapWeight(location) - playerMapWeight);
+            if (reach != null && reach.TryGetValue(location, out var way))
+                return way.Cost + (way.Arrival is Vector2 arrival ? Vector2.Distance(arrival, chestTile) : 0f);
+
+            return UnreachableDistance + Math.Abs(GetMapWeight(location) - playerMapWeight);
         }
 
         // ===================== "DID YOU MEAN" (failed search) =====================
@@ -1823,7 +2384,7 @@ namespace ChestItemFinder
                 // the old highlights stay until the clicked word's search really runs (it starts at once, see SearchMenu autoSearchText; ScanChests
                 // replaces them, and releases the "Keep highlights" lock, only then)
 
-                Game1.activeClickableMenu = new SearchMenu(ScanChests, searchHistory, SaveSearchHistory, null, CreateSuggestionProvider(), query, resultQuality, GetTermTip, CreateSpellingProvider());
+                Game1.activeClickableMenu = new SearchMenu(ScanChests, searchHistory, SaveSearchHistory, null, CreateSuggestionProvider(), query, resultQuality, GetTermTip, CreateSpellingProvider(), TextRefersOnlyToNoQualityItems);
                 return;
             }
         }
@@ -1899,6 +2460,7 @@ namespace ChestItemFinder
             ["tool"] = new[] { -99 },
             ["tools"] = new[] { -99 },               // Object.toolCategory
             ["clothing"] = new[] { -100 },                                              // Object.clothingCategory
+            ["clothes"] = new[] { -100 },            // hidden second spelling: searched and named as "clothing", never shown as "clothes"
             ["trinket"] = new[] { -101 },
             ["trinkets"] = new[] { -101 },           // Object.trinketCategory
             ["book"] = new[] { -102 },
@@ -1966,6 +2528,85 @@ namespace ChestItemFinder
 
         private static readonly char[] NameWordSeparators = { ' ', '\t', '_', '-', '\'' };
 
+        // ===================== WORD FAMILIES (clothing and furniture) =====================
+        // Normally a whole item name finds only that item ("Coal", "Stone"). Clothing and furniture are different: the game has a plain "Shirt"
+        // (dozens of them), "Pants" and "Bed", and next to them hundreds of "... Shirt", "... Pants", "... Bed". A player who types "shirt" means
+        // shirts, not only the plain one. So when the whole name is a clothing / furniture item AND other clothing / furniture of the game have that
+        // name as whole words in theirs, the word finds the whole family: the plain item and every clothing / furniture with those words
+        // ("Shirt" -> Shirt, Bridal Shirt, Flannel Shirt ...; "tank top" -> Tank Top, Crop Tank Top (F) ...). "Bridal Shirt" has no family (no other
+        // name holds it), so it still finds only itself. In every list (drop-down, tip, "Did you mean") the plain item comes first.
+        // Honey and Bait need none of this: they are category words of their own (every honey, every bait).
+
+        private readonly Dictionary<string, bool> wordFamilyCache = new();
+
+        /// <summary>Clothing (shirts, pants) and furniture (beds included): the kinds that have word families.</summary>
+        private static bool IsWordFamilyKind(Item item)
+        {
+            return item is Clothing || item is Furniture;
+        }
+
+        /// <summary>True if the name holds the normalized words as one run of whole words ("Crop Tank Top (F)" holds "tanktop", not "anktop").</summary>
+        private static bool HasWholeWordRun(string? name, string normWords)
+        {
+            string[] words = SplitNameWords(name).Select(Norm).Where(w => w.Length > 0).ToArray();
+            for (int start = 0; start < words.Length; start++)
+            {
+                string run = "";
+                for (int end = start; end < words.Length && run.Length < normWords.Length; end++)
+                {
+                    run += words[end];
+                    if (run == normWords)
+                        return true;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>True if the item belongs to the word family of the normalized name (the plain item itself included).</summary>
+        private static bool IsInWordFamily(Item item, string normName)
+        {
+            return IsWordFamilyKind(item) && (HasWholeWordRun(item.DisplayName, normName) || HasWholeWordRun(item.Name, normName));
+        }
+
+        /// <summary>
+        /// True if the normalized name is a clothing / furniture item of the game that has a word family: some OTHER clothing / furniture of the game
+        /// holds it as whole words ("shirt", "pants", "bed", "tanktop"). Worked out once per name.
+        /// </summary>
+        internal bool IsWordFamilyName(string normName)
+        {
+            if (string.IsNullOrEmpty(normName))
+                return false;
+            if (wordFamilyCache.TryGetValue(normName, out bool known))
+                return known;
+
+            bool result = false;
+            try
+            {
+                List<Item> catalog = GetGameItemCatalog();
+                bool plainIsFamilyKind = catalog.Any(i => IsWordFamilyKind(i) && NameEquals(i, normName));
+                result = plainIsFamilyKind && catalog.Any(i => !NameEquals(i, normName) && IsInWordFamily(i, normName));
+            }
+            catch (Exception ex)
+            {
+                Monitor.Log($"Could not check the word family of '{normName}': {ex.Message}", LogLevel.Trace);
+            }
+
+            wordFamilyCache[normName] = result;
+            return result;
+        }
+
+        /// <summary>The names of a word family, as the game shows them (the plain name first is up to the caller), each once.</summary>
+        private HashSet<string> GetWordFamilyNames(string normName)
+        {
+            var names = new HashSet<string>(StringComparer.Ordinal);
+            foreach (Item item in GetGameItemCatalog())
+            {
+                if (IsInWordFamily(item, normName) && !string.IsNullOrWhiteSpace(item.DisplayName))
+                    names.Add(Norm(item.DisplayName));
+            }
+            return names;
+        }
+
         private static IEnumerable<string> SplitNameWords(string? name)
         {
             return (name ?? "").ToLowerInvariant().Split(NameWordSeparators, StringSplitOptions.RemoveEmptyEntries);
@@ -2018,6 +2659,115 @@ namespace ChestItemFinder
         private static readonly char[] QuerySeparators = { ' ', '\t', '_', '-' };
 
         // lower-case and drop spaces, underscores and hyphens: "Star Fruit" -> "starfruit"
+        // ===================== ITEM NAMES WITH BRACKETS OF THEIR OWN =====================
+        // Brackets in the search text are normally only legal as the " (category)" label. A few items have brackets in their real name
+        // ("Crop Tank Top (F)" / "(M)"): such a name, typed whole (case, spaces, hyphens ignored), is a normal search word, brackets and all.
+        // The list is read from the game's own items (every kind a chest can hold), so items of other mods are covered too.
+
+        private static Dictionary<string, string>? bracketItemNames;   // Norm(name) -> name as the game shows it
+
+        /// <summary>Every item name of the game that has a round bracket (half-width or full-width), sorted.</summary>
+        internal static List<string> GetBracketItemNames()
+        {
+            if (bracketItemNames == null)
+            {
+                var names = new Dictionary<string, string>();
+                foreach (var type in ItemRegistry.ItemTypes)
+                {
+                    if (!CatalogItemTypes.Contains(type.Identifier))
+                        continue;
+                    foreach (string id in type.GetAllIds())
+                    {
+                        try
+                        {
+                            string? name = type.GetData(id)?.DisplayName?.Trim();
+                            if (!string.IsNullOrEmpty(name) && name.IndexOfAny(new[] { '(', ')', '\uFF08', '\uFF09' }) >= 0 && !name.StartsWith("[", StringComparison.Ordinal))
+                                names.TryAdd(Norm(name), name);
+                        }
+                        catch (Exception)
+                        {
+                            // an item without readable data is left out
+                        }
+                    }
+                }
+                bracketItemNames = names;
+            }
+
+            return bracketItemNames.Values.OrderBy(n => n, StringComparer.OrdinalIgnoreCase).ToList();
+        }
+
+        /// <summary>True if the text is the whole name of an item that has brackets in its name ("crop tank top (f)").</summary>
+        internal static bool IsBracketItemName(string? text)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+                return false;
+            if (bracketItemNames == null)
+                GetBracketItemNames();
+            return bracketItemNames!.ContainsKey(Norm(text.Trim()));
+        }
+
+        // ===================== FLAVOURED ITEMS (icons of built names) =====================
+        // Jelly, Juice, Pickles, Wine, Dried Fruit, Dried Mushrooms, Smoked Fish, Roe, Aged Roe and Targeted Bait take the colour of what they are
+        // made of. A name the suggestion list builds ("Starfruit Wine") is drawn with the icon of the item the game itself would make from that
+        // ingredient (the game's own CreateFlavoredItem), so it looks like in the inventory: a yellow bottle for Starfruit Wine, a blue one for
+        // Ancient Fruit Wine. Honey keeps one icon for every flower, like in the game.
+
+        /// <summary>The kind of flavoured item of each base product (the name of the game's Object.PreserveType value).</summary>
+        private static readonly Dictionary<string, string> PreserveTypeOfProduct = new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["(O)348"] = "Wine",
+            ["(O)344"] = "Jelly",
+            ["(O)342"] = "Pickle",
+            ["(O)350"] = "Juice",
+            ["(O)812"] = "Roe",
+            ["(O)447"] = "AgedRoe",
+            ["(O)340"] = "Honey",
+            ["(O)SpecificBait"] = "Bait",
+            ["(O)DriedFruit"] = "DriedFruit",
+            ["(O)DriedMushrooms"] = "DriedMushroom",
+            ["(O)SmokedFish"] = "SmokedFish"
+        };
+
+        /// <summary>The item the game makes from the ingredient as this product ("(O)348" + Starfruit = Starfruit Wine), or null if it cannot.</summary>
+        internal static Item? CreateFlavoredItem(string productId, string ingredientId)
+        {
+            try
+            {
+                if (!PreserveTypeOfProduct.TryGetValue(productId, out string? typeName)
+                    || !Enum.TryParse(typeName, out StardewValley.Object.PreserveType preserveType))
+                    return null;
+                if (ItemRegistry.Create(ingredientId) is not StardewValley.Object ingredient)
+                    return null;
+                return ItemRegistry.GetObjectTypeDefinition().CreateFlavoredItem(preserveType, ingredient);
+            }
+            catch (Exception)
+            {
+                return null;   // the plain product's icon is drawn instead
+            }
+        }
+
+        // ===================== ITEM LABEL: "Egg (item)" =====================
+        // A few category words are also the name of a real item: "Egg" (the white and the brown one), "Milk", "Honey", "Bait". Typed alone the word
+        // means the category (every egg). The drop-down offers the item itself as "Egg (item)", and that label searches ONLY the items of exactly
+        // that name (both Eggs). Case and spaces around the brackets do not matter; half-width and full-width brackets both work.
+
+        private static readonly Regex ItemLabelPattern = new(
+            @"\s*[(\uFF08]\s*item\s*[)\uFF09]\s*$",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+        /// <summary>True if the text ends with the " (item)" label; <paramref name="name"/> is the text before it ("Egg (item)" -> "Egg").</summary>
+        internal static bool TryStripItemLabel(string? text, out string name)
+        {
+            name = "";
+            if (string.IsNullOrWhiteSpace(text))
+                return false;
+            Match match = ItemLabelPattern.Match(text);
+            if (!match.Success)
+                return false;
+            name = text.Substring(0, match.Index).Trim();
+            return name.Length > 0;
+        }
+
         private static string Norm(string s)
         {
             return new string(s.Where(ch => !char.IsWhiteSpace(ch) && ch != '_' && ch != '-').ToArray()).ToLowerInvariant();
@@ -2084,13 +2834,13 @@ namespace ChestItemFinder
                 || Norm(item.Name) == normQuery;
         }
 
-        // P4: the name contains the query (literal, case-insensitive; also ignoring spaces)
+        // P4: the name contains the query (case, spaces, hyphens ignored), WORD-ALIGNED (see SuggestionIndex, WORD-ALIGNED MATCHING): "sshirt" is not
+        // in "Flames Shirt". normQuery: the spelling to look for (a plural / singular spelling of the query is fine); query: what was typed.
         private static bool NameContains(Item item, string query, string normQuery)
         {
-            return item.DisplayName.Contains(query, StringComparison.OrdinalIgnoreCase)
-                || item.Name.Contains(query, StringComparison.OrdinalIgnoreCase)
-                || Norm(item.DisplayName).Contains(normQuery)
-                || Norm(item.Name).Contains(normQuery);
+            List<string> words = SuggestionIndex.VariantWordKeys(query, normQuery);
+            return SuggestionIndex.NameMatchesAligned(item.DisplayName, words)
+                || SuggestionIndex.NameMatchesAligned(item.Name, words);
         }
 
         // Singular and plural spellings of a normalized query (see Norm), so "cranberry" finds "Cranberries" and the other way round.
@@ -2294,11 +3044,27 @@ namespace ChestItemFinder
             return HasCommas(text) ? string.Join(", ", GetCommaTerms(text)) : StripCategorySuffix(text);
         }
 
-        /// <summary>The separate words of a normalized query: split at the commas if there are any, otherwise at the spaces (see SplitBySpaces).</summary>
+        /// <summary>The words a search really takes: ResolveAllTerms, at most MaxSearchTerms of them (see AT MOST THREE AT A TIME).</summary>
         private List<string> ResolveTerms(List<Item> allItems, string queryText)
         {
+            return ResolveAllTerms(allItems, queryText).Take(MaxSearchTerms).ToList();
+        }
+
+        /// <summary>
+        /// The separate words of a normalized query: split at the commas if there are any, otherwise at the spaces (see SplitBySpaces). A word
+        /// that means the same as an earlier one ("egg fruit egg", "fruit fruits", "trash junk") is left out: only its first place counts.
+        /// </summary>
+        private List<string> ResolveAllTerms(List<Item> allItems, string queryText)
+        {
+            if (!HasCommas(queryText) && TryStripItemLabel(queryText, out _))
+                return new List<string> { queryText.Trim() };   // "Egg (item)" is one word, its label included
+
+            // an alias or another spelling of a name ("dried grape" -> Raisins, "cranberry jelly" -> Cranberries Jelly): ONE word, the game's name
+            if (!HasCommas(queryText) && TryResolveName(queryText, out _, out _))
+                return new List<string> { ResolveSearchName(queryText) };
+
             List<string> coarse = HasCommas(queryText)
-                ? GetCommaTerms(queryText)
+                ? GetCommaTerms(queryText).Select(ResolveSearchName).ToList()   // "dried grape, fish": each part may be an alias
                 : SplitBySpaces(allItems, queryText);
 
             // then every term may still be cut at a hyphen / underscore between two letters ("fruit-fish"), unless it is one known name ("star-fruit")
@@ -2308,13 +3074,152 @@ namespace ChestItemFinder
             {
                 foreach (string piece in SplitSoft(allItems, term))
                 {
-                    if (seen.Add(Norm(piece)))
-                        result.Add(piece);
+                    string shown = WithCategoryAlias(piece);   // "clothes" is searched and shown as "clothing"
+                    if (seen.Add(TermIdentity(shown)))
+                        result.Add(shown);
                 }
             }
 
-            return result.Count > 0 ? result : coarse;
+            return result.Count > 0 ? result : coarse.Select(WithCategoryAlias).ToList();
         }
+
+        /// <summary>
+        /// The words of a title in the order they are named, with the category label only where it belongs: the categories first (in the order
+        /// typed) followed by ONE " (category)" / " (categories)", then the item names without a label. Only categories:
+        /// 'fruit', 'fish' (categories) (the label is the suffix). No category: no label. Mixed: 'egg', 'fish' (categories), 'Strawberry'.
+        /// A part of a word ("win") is not a category and gets no label.
+        /// </summary>
+        private static (List<string> Ordered, int LabelAfter, string MidLabel, string EndLabel) LabelCategories(IReadOnlyList<string> terms)
+        {
+            var categories = terms.Where(t => IsCategoryWord(StripCategorySuffix(t))).ToList();
+            var others = terms.Where(t => !IsCategoryWord(StripCategorySuffix(t))).ToList();
+            string label = categories.Count == 1 ? " (category)" : categories.Count > 1 ? " (categories)" : "";
+            var ordered = categories.Concat(others).ToList();
+            return others.Count == 0
+                ? (ordered, -1, "", label)
+                : (ordered, categories.Count - 1, label, "");
+        }
+
+        /// <summary>What a search word stands for: the category it names (so "fruit" / "fruits", "trash" / "junk" are one), else its spelling.</summary>
+        internal static string TermIdentity(string term)
+        {
+            string plain = StripCategorySuffix(term ?? "");
+            if (IsCategoryWord(plain))
+            {
+                string? key = CategoryKey(plain);
+                if (key != null)
+                    return "category:" + key;
+            }
+            return Norm(plain);
+        }
+
+        // ===================== AT MOST THREE AT A TIME =====================
+        // One search takes at most three things, categories and item names alike: "fish fruit egg wine" searches fish, fruit, egg; "wine" is left
+        // out. The search box says so while typing (the big white note above it), and the result panel once more in its last line. A word repeated
+        // ("egg fruit egg") counts once.
+
+        /// <summary>How many words (categories or items) one search takes.</summary>
+        internal const int MaxSearchTerms = 3;
+
+        /// <summary>The same limit, by the name the search box uses for its several-category drop-down.</summary>
+        internal const int MaxCategoryTerms = MaxSearchTerms;
+
+        /// <summary>The words of the last search that were left out (the fourth one on), for the last line of the result panel. Empty = none.</summary>
+        private List<string> lastIgnoredTerms = new();
+
+        /// <summary>
+        /// The words of a text that a search would leave out (the fourth one on), in the order typed, split exactly like the search splits it
+        /// (item names of several words stay one: "ancient fruit fish egg wine" leaves out "wine" only). Empty when the mod is not running.
+        /// </summary>
+        internal static List<string> GetIgnoredSearchTerms(string text)
+        {
+            text = (text ?? "").Trim();
+            ModEntry? mod = Instance;
+            if (mod == null || text.Length == 0)
+                return new List<string>();
+
+            // fewer than four pieces cannot be too many: no work while typing a short search
+            int separators = text.Count(ch => ch == ' ' || ch == ',' || ch == '\uFF0C' || ch == '\u3001');
+            if (separators < MaxSearchTerms)
+                return new List<string>();
+
+            return ResolveBoxTerms(text).Skip(MaxSearchTerms).ToList();
+        }
+
+        /// <summary>
+        /// Every word of the search box text, split exactly like the search splits it (repeats left out, no limit): "ancient fruit, fish, egg" ->
+        /// Ancient Fruit | fish | egg. The game's whole item list stands in for the chests. Empty when the mod is not running.
+        /// </summary>
+        internal static List<string> ResolveBoxTerms(string text)
+        {
+            text = (text ?? "").Trim();
+            ModEntry? mod = Instance;
+            if (mod == null || text.Length == 0)
+                return new List<string>();
+            try
+            {
+                return mod.ResolveAllTerms(mod.GetGameItemCatalog(), NormalizeQueryText(text));
+            }
+            catch (Exception ex)
+            {
+                mod.Monitor.LogOnce($"Could not split the words of the search box: {ex.Message}", LogLevel.Trace);
+                return new List<string>();
+            }
+        }
+
+        /// <summary>
+        /// True if the word is complete: a category word, a whole item name of the game, or a whole item name with the " (item)" label. A half
+        /// typed word ("eg", "ancient fr") is not.
+        /// </summary>
+        internal static bool IsCompleteTerm(string term)
+        {
+            ModEntry? mod = Instance;
+            if (mod == null || string.IsNullOrWhiteSpace(term))
+                return false;
+            if (IsCategoryWord(StripCategorySuffix(term)))
+                return true;
+            Func<string, bool> isKnownName = mod.GetKnownNameCheck();
+            return TryStripItemLabel(term, out string labeled) ? isKnownName(labeled) : isKnownName(term.Trim());
+        }
+
+        /// <summary>"clothes" -> "clothing" (the hidden second spelling, see SingleWordCategories); any other text as it is.</summary>
+        internal static string WithCategoryAlias(string term)
+        {
+            return Norm(StripCategorySuffix(term ?? "")) == "clothes" ? "clothing" : term ?? "";
+        }
+
+        /// <summary>
+        /// The words of a text as the category check sees them: at the commas if there are any, otherwise at the spaces, where a run of words that is
+        /// ONE category word stays together ("artisan goods fish" -> artisan goods | fish). Used by the search box (the drop-down for several
+        /// categories, the note about a fourth one); the search itself splits with the item names too (ResolveTerms).
+        /// </summary>
+        internal static List<string> SplitKeepingCategories(string text)
+        {
+            text = (text ?? "").Trim();
+            if (HasCommas(text))
+                return GetCommaTerms(text).Select(StripCategorySuffix).Where(t => t.Length > 0).ToList();
+
+            string[] words = text.Split(SpaceSeparators, StringSplitOptions.RemoveEmptyEntries).Where(w => !IsOnlySoftSeparators(w)).ToArray();
+            var pieces = new List<string>();
+            int index = 0;
+            while (index < words.Length)
+            {
+                int take = 1;
+                for (int length = words.Length - index; length >= 2; length--)
+                {
+                    if (IsCategoryWord(string.Join(" ", words, index, length)))
+                    {
+                        take = length;
+                        break;
+                    }
+                }
+                pieces.Add(string.Join(" ", words, index, take));
+                index += take;
+            }
+            return pieces;
+        }
+
+
 
         /// <summary>
         /// Splits one term at the hyphens / underscores between two letters, but never through something the search already understands as ONE
@@ -2359,6 +3264,15 @@ namespace ChestItemFinder
 
             Func<string, bool> isKnownName = GetKnownNameCheck();
             bool IsOneThing(string phrase) => IsKnownThing(allItems, isKnownName, phrase);
+
+            // every word a category ("fruit wine", "fish fruit egg", "artisan goods fish"): that many categories, never one phrase. Only a whole
+            // item name made of category words would stay one (the item); "fruit wine" is not one ("Starfruit Wine" only CONTAINS it)
+            if (!isKnownName(text) && !IsCategoryWord(text))
+            {
+                List<string> categoryPieces = SplitKeepingCategories(text);
+                if (categoryPieces.Count >= 2 && categoryPieces.All(piece => IsCategoryWord(piece)))
+                    return categoryPieces;
+            }
 
             if (IsOneThing(text))
                 return new List<string> { text };
@@ -2433,13 +3347,14 @@ namespace ChestItemFinder
         // " (Invalid: 'a', 'b')" (always shortened, they are whatever the player typed). That whole part, brackets included, is remembered in
         // notifyInvalidStart / notifyInvalidLength so it can be drawn in dark red, and the invalid names are bold like every other name.
         private string BuildQuotedTitle(string prefix, IReadOnlyList<string> names, bool shorten, string suffix, IReadOnlyList<string>? invalidNames = null,
-            IReadOnlyList<string>? noItemCategories = null, IReadOnlyList<string>? noItemNames = null)
+            IReadOnlyList<string>? noItemCategories = null, IReadOnlyList<string>? noItemNames = null, int labelAfter = -1, string midLabel = "")
         {
             var title = new System.Text.StringBuilder(prefix);
             var ranges = new List<(int Start, int Length)>();
             var rangeTerms = new List<string>();   // the full word of every range, in the same order (for the hover tips)
 
-            void AppendNames(IReadOnlyList<string> list, bool cutLongNames, string nameSuffix = "")
+            // labelAt / label: after the name with this index, the label ("'egg', 'fish' (categories), 'Strawberry'": only the categories carry it)
+            void AppendNames(IReadOnlyList<string> list, bool cutLongNames, string nameSuffix = "", int labelAt = -1, string label = "")
             {
                 for (int i = 0; i < list.Count; i++)
                 {
@@ -2469,10 +3384,12 @@ namespace ChestItemFinder
                     }
 
                     title.Append(nameSuffix);   // e.g. " (category)" after 'vegetable' in the "No items found in ..." part
+                    if (i == labelAt)
+                        title.Append(label);
                 }
             }
 
-            AppendNames(names, shorten);
+            AppendNames(names, shorten, "", labelAfter, midLabel);
             title.Append(suffix);
 
             notifyInvalidStart = -1;
@@ -2532,6 +3449,17 @@ namespace ChestItemFinder
         // One search term: the N / P1 / P2 / P3 / P4 rules above (this is the whole search of the versions before multi-term search).
         private Func<Item, bool> BuildSingleMatcher(List<Item> allItems, string rawQuery)
         {
+            // "fruit wine": the products made from that kind of ingredient (see MADE FROM)
+            if (TryParseMadeFrom(StripCategorySuffix(rawQuery), out int[] madeFromCategories, out DynamicCategory? madeProduct) && madeProduct != null)
+                return i => madeProduct.Matches(i) && IngredientCategoryOf(i) is int ingredientCategory && madeFromCategories.Contains(ingredientCategory);
+
+            // "Egg (item)": only the items of exactly that name (see ITEM LABEL), never the category
+            if (TryStripItemLabel(rawQuery, out string itemOnly))
+            {
+                string exactName = Norm(itemOnly);
+                return i => NameEquals(i, exactName);
+            }
+
             // "fruit (category)" (as shown by the tip and the drop-down) is searched exactly like "fruit"
             string query = StripCategorySuffix(rawQuery);
             string normQuery = Norm(query);
@@ -2572,12 +3500,18 @@ namespace ChestItemFinder
             // a plural "s" off ("weds" -> "wed") is only used when the typed word finds nothing in the game and the shorter word is a real name (GetSearchVariants)
             List<string> variants = GetSearchVariants(query);
 
-            // P3: exact item name -> only that item (the typed spelling is tried first, then its singular / plural)
+            // P3: exact item name -> only that item (the typed spelling is tried first, then its singular / plural).
+            // Except a WORD FAMILY of clothing / furniture ("Shirt", "Pants", "Bed"): the plain item and every clothing / furniture whose name has
+            // that word ("Bridal Shirt", "Double Bed"), see IsWordFamilyName
             foreach (string variant in variants)
             {
                 string exact = variant;
                 if (allItems.Any(i => NameEquals(i, exact)))
+                {
+                    if (IsWordFamilyName(exact))
+                        return i => IsInWordFamily(i, exact);
                     return i => NameEquals(i, exact);
+                }
             }
 
             // P4: contains (fallback); the singular / plural spellings only add matches, they never remove any.
@@ -2586,7 +3520,7 @@ namespace ChestItemFinder
             // every category whose name contains the text are found too, exactly what the hover tip announces ("Fish (category)" first, see
             // FindMatchedEntries). Spelling distance plays no part here: nothing is ever refused or called Invalid because it is "close to" something.
             Func<Item, bool> byName = i => NameContains(i, query, normQuery)
-                || variants.Skip(1).Any(v => NameContains(i, v, v));
+                || variants.Skip(1).Any(v => NameContains(i, query, v));
 
             if (!PartialCategorySearch)
                 return byName;
@@ -2637,6 +3571,8 @@ namespace ChestItemFinder
         /// </summary>
         private bool ExistsInGame(string term)
         {
+            if (TryStripItemLabel(term, out string labeledItem))
+                term = labeledItem;   // "Egg (item)": the item Egg
             string text = StripCategorySuffix(term ?? "").Trim();
             if (text.Length == 0)
                 return false;
@@ -2647,7 +3583,7 @@ namespace ChestItemFinder
             {
                 suggestionIndex ??= new SuggestionIndex();
                 suggestionIndex.EnsureBuilt();
-                return GetSearchVariants(text).Any(variant => suggestionIndex.AnyNameContains(variant));
+                return GetSearchVariants(text).Any(variant => suggestionIndex.AnyNameContains(variant, text));
             }
             catch (Exception ex)
             {
@@ -2679,7 +3615,93 @@ namespace ChestItemFinder
                     return true;
             }
 
+            return TryParseMadeFrom(query, out _, out _);   // "fruit wine": the wines made from fruit (see MADE FROM)
+        }
+
+        // ===================== MADE FROM: "fruit wine", "vegetable juice", "fish roe" =====================
+        // An ingredient category followed by a product the game makes from it is ONE search word: the products made from that kind of ingredient.
+        // "fruit wine" = every wine made from a fruit (in the game that is every wine), "vegetable pickles" = the pickles made from vegetables (not
+        // the ones from forage), "fish roe" = every roe. It counts as a category (labelled "(category)"). Any other pair of categories ("fish fruit")
+        // stays two separate categories.
+
+        /// <summary>For each product (its base item id): the categories of the ingredients the game makes it from.</summary>
+        private static readonly Dictionary<string, int[]> ProductIngredientCategories = new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["(O)348"] = new[] { -79 },                 // Wine: fruit (keg)
+            ["(O)344"] = new[] { -79 },                 // Jelly: fruit (preserves jar)
+            ["(O)350"] = new[] { -75, -81 },            // Juice: vegetables, forage (keg)
+            ["(O)342"] = new[] { -75, -81 },            // Pickles: vegetables, forage and mushrooms (preserves jar)
+            ["(O)340"] = new[] { -80 },                 // Honey: flowers
+            ["(O)812"] = new[] { -4 },                  // Roe: fish (fish pond)
+            ["(O)447"] = new[] { -4 },                  // Aged Roe: (the roe of) fish
+            ["(O)SmokedFish"] = new[] { -4 },           // Smoked Fish: fish
+            ["(O)DriedFruit"] = new[] { -79 },          // Dried Fruit: fruit (dehydrator)
+            ["(O)DriedMushrooms"] = new[] { -81 },      // Dried Mushrooms: mushrooms (forage category)
+            ["(O)SpecificBait"] = new[] { -4 }          // Targeted Bait: fish
+        };
+
+        /// <summary>
+        /// True if the text is "ingredient category + product" with a real link ("fruit wine"): the ingredient categories it keeps and the product.
+        /// </summary>
+        private static bool TryParseMadeFrom(string text, out int[] ingredientCategories, out DynamicCategory? product)
+        {
+            ingredientCategories = Array.Empty<int>();
+            product = null;
+            string[] words = (text ?? "").Trim().ToLowerInvariant().Split(QuerySeparators, StringSplitOptions.RemoveEmptyEntries);
+            for (int split = 1; split < words.Length; split++)
+            {
+                string ingredientWord = string.Join(" ", words, 0, split);
+                if (!SingleWordCategories.TryGetValue(ingredientWord, out int[]? ids))
+                    continue;
+                DynamicCategory? made = FindDynamicCategory(Norm(string.Join("", words, split, words.Length - split)));
+                if (made == null || !made.IsCategory)
+                    continue;
+
+                int[] allowed = made.QualifiedIds
+                    .SelectMany(id => ProductIngredientCategories.TryGetValue(id, out int[]? madeOf) ? madeOf : Array.Empty<int>())
+                    .Intersect(ids)
+                    .ToArray();
+                if (allowed.Length == 0)
+                    continue;
+
+                ingredientCategories = allowed;
+                product = made;
+                return true;
+            }
             return false;
+        }
+
+        /// <summary>
+        /// For the drop-down (SuggestionIndex, CATEGORY EXPANSION): when the word is "ingredient category + product" ("fruit wine"), the base ids of
+        /// the product ("(O)348"), the ingredient categories it keeps (fruit) and whether those are ALL the ingredients the product can be made of
+        /// (wine: only fruit, so every wine is a fruit wine; juice: vegetables and forage, so "vegetable juice" is only a part). The same rule the
+        /// search uses (TryParseMadeFrom), so the drop-down lists exactly what the search finds.
+        /// </summary>
+        internal static bool TryGetMadeFrom(string word, out string[] productIds, out int[] ingredientCategories, out bool coversEveryIngredient)
+        {
+            productIds = Array.Empty<string>();
+            ingredientCategories = Array.Empty<int>();
+            coversEveryIngredient = false;
+            if (!TryParseMadeFrom(StripCategorySuffix((word ?? "").Trim()), out int[] allowed, out DynamicCategory? product) || product == null)
+                return false;
+
+            productIds = product.QualifiedIds;
+            ingredientCategories = allowed;
+            coversEveryIngredient = product.QualifiedIds
+                .SelectMany(id => ProductIngredientCategories.TryGetValue(id, out int[]? madeOf) ? madeOf : Array.Empty<int>())
+                .All(allowed.Contains);
+            return true;
+        }
+
+        /// <summary>The category of what a flavoured item is made of (Starfruit Wine -> fruit), or null.</summary>
+        private static int? IngredientCategoryOf(Item item)
+        {
+            if (item is not StardewValley.Object obj)
+                return null;
+            string? ingredient = obj.preservedParentSheetIndex.Value;
+            if (string.IsNullOrEmpty(ingredient))
+                return null;
+            return ItemRegistry.GetData(ingredient.StartsWith("(", StringComparison.Ordinal) ? ingredient : "(O)" + ingredient)?.Category;
         }
 
         /// <summary>
@@ -2691,27 +3713,46 @@ namespace ChestItemFinder
             return PluralVariants(Norm(term)).Any(isKnownName);
         }
 
-        /// <summary>The hint shown instead of searching "vegetable jelly" (see <see cref="IsVegetableJellyQuery"/>).</summary>
-        internal const string VegetableJellyHint = "Jelly is made from fruit. Vegetables become Pickles.";
+        /// <summary>
+        /// A product the game never makes ("corn jelly", "carp wine", "fruit juice", see SuggestionIndex, IMPOSSIBLE PRODUCTS): what the search box
+        /// shows instead (the two lines). Null when the text is fine or the mod is not running. Quality words must be gone already.
+        /// </summary>
+        internal static SuggestionIndex.ImpossibleProduct? GetImpossibleProduct(string text)
+        {
+            SuggestionIndex? index = Instance?.suggestionIndex;
+            if (index == null || HasCommas(text ?? ""))
+                return null;
+            return index.GetImpossibleProduct(StripCategorySuffix((text ?? "").Trim()));
+        }
 
         /// <summary>
-        /// True for the impossible combination "vegetable jelly" (also "vegetables jelly", "jelly vegetable", "vegetable-jelly", with or without a
-        /// " (category)" label): jelly is made from fruit, vegetables become pickles, so there is nothing to search for. Only a query of exactly these
-        /// two words counts; with a comma ("vegetable, jelly") the player asks for two separate things and the normal search runs.
+        /// An alias ("dried grape" -> Raisins) or another singular / plural spelling of a name ("cranberry jelly" -> Cranberries Jelly), see
+        /// SuggestionIndex, ALIASES AND OTHER SPELLINGS: the game's name, and the note of an alias (null for a spelling). False for anything else.
         /// </summary>
-        internal static bool IsVegetableJellyQuery(string? text)
+        internal static bool TryResolveName(string text, out string name, out string? note)
         {
-            string plain = StripCategorySuffix((text ?? "").Trim());
-            if (plain.Length == 0 || HasCommas(plain))
+            name = "";
+            note = null;
+            SuggestionIndex? index = Instance?.suggestionIndex;
+            if (index == null || HasCommas(text ?? ""))
                 return false;
+            return index.TryResolveName(StripCategorySuffix((text ?? "").Trim()), out name, out note);
+        }
 
-            string[] tokens = plain.ToLowerInvariant().Split(QuerySeparators, StringSplitOptions.RemoveEmptyEntries);
-            if (tokens.Length != 2)
-                return false;
+        /// <summary>
+        /// The notes of the aliases the last search resolved (game name, normalized -> "Dried grapes are called Raisins in the game."): the tip of
+        /// that word in the result title starts with it. Cleared when a new search starts.
+        /// </summary>
+        private readonly Dictionary<string, string> searchAliasNotes = new(StringComparer.Ordinal);
 
-            static bool IsVegetable(string w) => w == "vegetable" || w == "vegetables";
-            static bool IsJelly(string w) => w == "jelly" || w == "jellies";
-            return (IsVegetable(tokens[0]) && IsJelly(tokens[1])) || (IsJelly(tokens[0]) && IsVegetable(tokens[1]));
+        /// <summary>A search word with its alias / other spelling resolved to the game's name (the note of an alias is remembered for the title).</summary>
+        private string ResolveSearchName(string term)
+        {
+            if (!TryResolveName(term, out string name, out string? note))
+                return term;
+            if (note != null)
+                searchAliasNotes[Norm(name)] = note;
+            return name;
         }
 
         // Categories whose items can carry a quality star (silver / gold / iridium). Items outside these
@@ -2745,6 +3786,37 @@ namespace ChestItemFinder
 
         /// <summary>The star filter of the result that is on the panel (AnyQuality = the outline star). Set only when a search is accepted, so a refused search leaves it alone.</summary>
         private int resultQuality = AnyQuality;
+
+        // ===================== ONE ROW PER QUALITY (a search for ONE item) =====================
+        // After a search (Enter) for exactly ONE item that can have stars ("apple wine", not a category, not two words), the item lists show one
+        // row per quality instead of one row for all of them: plain, silver, gold, iridium (low to high), each icon with its star, like the game's
+        // own inventory. With a star filter there is just the one row of that star. Every other search (a category, several words, an item that
+        // never has quality) keeps one row per item name. The same rows everywhere: the place list of the result panel, the hover tip of a
+        // highlighted chest and the "Found" note of an opened chest. The drop-down and "Did you mean" are not touched (they are not about stars).
+        // A row's key is the item name plus QualityRowSeparator plus the quality; RowName / RowQuality take it apart again.
+        private bool singleItemQualityRows = false;
+        private const char QualityRowSeparator = '\u001F';
+
+        /// <summary>The key of an item's row in the item lists: its name, or with one row per quality, its name and quality.</summary>
+        private string RowKey(Item item)
+        {
+            string name = GetShownItemName(item);
+            return singleItemQualityRows ? name + QualityRowSeparator + item.Quality.ToString(CultureInfo.InvariantCulture) : name;
+        }
+
+        /// <summary>The item name of a row key ("Apple Wine" of "Apple Wine" + quality).</summary>
+        private static string RowName(string key)
+        {
+            int cut = key.IndexOf(QualityRowSeparator);
+            return cut < 0 ? key : key.Substring(0, cut);
+        }
+
+        /// <summary>The quality of a row key (0 for a row without one).</summary>
+        private static int RowQuality(string key)
+        {
+            int cut = key.IndexOf(QualityRowSeparator);
+            return cut >= 0 && int.TryParse(key.Substring(cut + 1), NumberStyles.Integer, CultureInfo.InvariantCulture, out int quality) ? quality : 0;
+        }
 
         /// <summary>
         /// True when the search only refers to items that can never carry a star (Wood, Stone, cooked dishes, ...), whatever star filter is selected
@@ -2877,27 +3949,41 @@ namespace ChestItemFinder
         private const long ResultCloseFreshMs = 200;                      // the X counts as "on screen" if it was drawn this recently (real clock)
 
         private Rectangle resultCloseBounds;                              // where the X was drawn in the last HUD frame (UI pixels)
+        private bool resultCloseIsPeek;                                   // that X belongs to a peeked panel (see PEEK): a click only hides the peek
+
+        // PEEK (see where the result panel is drawn): the panel shown again by hovering the locked "Keep highlights" box, and until when it stays without the mouse
+        private bool peekActive;
+        private long peekUntilMs;
+        private const long PeekGraceMs = 2000;
         private long resultCloseDrawnMs = -1000000;
 
         // A left click on the red X of the result panel closes the panel. The click is swallowed, so it does not also swing a tool.
         // The mouse is read in UI coordinates, like the "Did you mean" words (see OnSuggestionClicked).
+        // With a controller, the A button does the same while the cursor is on the X (and is swallowed, so it does not also open a chest behind it).
         private void OnResultCloseClicked(object? sender, ButtonPressedEventArgs e)
         {
             if (IsHudClickTaken(e.Button))
                 return;   // the "Copy" bubble used this click
-            if (e.Button != SButton.MouseLeft)
+            if (e.Button != SButton.MouseLeft && e.Button != SButton.ControllerA)
                 return;
             if (!Context.IsWorldReady || Game1.activeClickableMenu != null)
                 return;
 
             long now = clock.ElapsedMilliseconds;
-            if (now - resultCloseDrawnMs > ResultCloseFreshMs || now >= notifyUntilMs)
+            if (now - resultCloseDrawnMs > ResultCloseFreshMs || (now >= notifyUntilMs && !resultCloseIsPeek))
                 return;   // the panel (and its X) is not on screen right now
             if (!resultCloseBounds.Contains(Game1.getMousePosition(true)))
                 return;
 
             Helper.Input.Suppress(e.Button);
             Game1.playSound("bigDeSelect");   // the sound of the game's own close buttons
+            if (resultCloseIsPeek)
+            {
+                // the X of a peeked panel: only the peek goes away (the highlights and the checkbox stay); hovering the box brings it back
+                peekActive = false;
+                resultCloseDrawnMs = -1000000;
+                return;
+            }
             CloseResultPanel();
         }
 
@@ -3169,37 +4255,33 @@ namespace ChestItemFinder
         /// </returns>
         private SearchReport ScanChests(string rawQuery, int quality = AnyQuality)
         {
+            searchAliasNotes.Clear();   // the notes of THIS search's aliases (see ResolveSearchName)
             string itemName = NormalizeQueryText(rawQuery);   // "fruit (category)" -> "fruit"; "fruit,fish" -> "fruit, fish" (the separate terms are worked out below)
             if (itemName.Length == 0)
             {
                 IsKeepHighlightsLocked = false;
                 highlightedChests.Clear();
                 highlightMatcher = null;
+                singleItemQualityRows = false;
                 chestTipSamples.Clear();
                 placeItems.Clear();
                 placeSamples.Clear();
+                placeKindCounts.Clear();
+                placeSectionItems.Clear();
                 placeEntries = new List<PlaceEntry>();
                 return new SearchReport(SearchOutcome.Done);
             }
 
             var locations = GetAllLocations().ToList();
 
-            // collect every chest once. An EMPTY chest can never match anything, so it is left out here: it costs nothing in the many loops below
-            // (late in a game a farm has hundreds of them). The same chest object is also never taken twice, so a chest counts once whatever happens.
+            // collect every chest and fridge once (GetAllContainers never gives the same one twice). An EMPTY one can never match anything, so it is
+            // left out here: it costs nothing in the many loops below (late in a game a farm has hundreds of chests).
             var allChests = new List<(GameLocation location, Vector2 position, Chest chest, string label)>();
-            var seenChests = new HashSet<Chest>(ReferenceEqualityComparer.Instance);
-            foreach (var (location, label) in locations)
+            foreach (var container in GetAllContainers(locations))
             {
-                foreach (var obj in location.objects.Pairs)
-                {
-                    if (obj.Value is not Chest chest)
-                        continue;
-                    if (chest.Items == null || !chest.Items.Any(i => i != null))
-                        continue;   // empty chest: skipped
-                    if (!seenChests.Add(chest))
-                        continue;   // this very chest was already collected
-                    allChests.Add((location, obj.Key, chest, label));
-                }
+                if (container.chest.Items == null || !container.chest.Items.Any(i => i != null))
+                    continue;   // empty: skipped
+                allChests.Add(container);
             }
 
             var allItems = allChests
@@ -3207,8 +4289,11 @@ namespace ChestItemFinder
                 .Where(i => i != null)
                 .ToList();
 
-            // one term = the search as it always was; several terms (commas or spaces) = an item counts if it matches ANY of them
-            List<string> terms = ResolveTerms(allItems, itemName);
+            // one term = the search as it always was; several terms (commas or spaces) = an item counts if it matches ANY of them.
+            // At most three (see AT MOST THREE AT A TIME): the rest is named in the last line of the result panel
+            List<string> allTerms = ResolveAllTerms(allItems, itemName);
+            List<string> terms = allTerms.Take(MaxSearchTerms).ToList();
+            lastIgnoredTerms = allTerms.Skip(MaxSearchTerms).ToList();
 
             // every term has its own matcher. With several terms, a term that cannot be searched at all (too short, only symbols, a character that
             // cannot belong to an item name) gets a matcher that matches nothing: it never stops the search, it is reported as invalid below.
@@ -3285,6 +4370,8 @@ namespace ChestItemFinder
             chestTipSamples.Clear();
             placeItems.Clear();
             placeSamples.Clear();
+            placeKindCounts.Clear();
+            placeSectionItems.Clear();
             placeEntries = new List<PlaceEntry>();
 
             bool anyQualityCapableMatch = false;   // at least one matched item can carry a star (Corn, Fish, ...)
@@ -3299,6 +4386,35 @@ namespace ChestItemFinder
             GameLocation? playerLocation = Game1.currentLocation;
             Vector2 playerTile = Game1.player?.Tile ?? Vector2.Zero;
             int playerMapWeight = GetMapWeight(playerLocation);
+            Dictionary<GameLocation, (float Cost, Vector2? Arrival, Point FirstExit)>? reach = null;
+            try
+            {
+                exitGraph = null;   // a new search reads the ways between the locations afresh (a building may have been built or moved)
+                if (playerLocation != null)
+                    reach = ComputeReach(GetExitGraph(), playerLocation, playerTile);
+            }
+            catch (Exception ex)
+            {
+                Monitor.LogOnce($"Could not work out the walking distances: {ex.Message}", LogLevel.Trace);   // the places keep the rough map order
+            }
+
+            // one row per quality (see ONE ROW PER QUALITY): one word, not a category, and everything it found is ONE item that can have stars
+            singleItemQualityRows = false;
+            try
+            {
+                if (terms.Count == 1 && !IsCategoryWord(StripCategorySuffix(terms[0])))
+                {
+                    List<Item> matched = allItems.Where(i => matches(i)).ToList();
+                    singleItemQualityRows = matched.Count > 0
+                        && matched.Select(GetShownItemName).Distinct(StringComparer.OrdinalIgnoreCase).Count() == 1
+                        && matched.Any(CanHaveQuality);
+                }
+            }
+            catch (Exception ex)
+            {
+                Monitor.Log($"Could not check for one row per quality: {ex.Message}", LogLevel.Trace);
+                singleItemQualityRows = false;
+            }
 
             // every chest is looked at once and counted once: a chest that matches several words of "fruit, fish" (or several of its items match)
             // is still ONE found chest, ONE highlight and one set of item totals, because the words are combined into ONE matcher ("matches")
@@ -3311,8 +4427,10 @@ namespace ChestItemFinder
                 if (!anyQualityCapableMatch && chest.Items.Any(i => i != null && matches(i) && CanHaveQuality(i)))
                     anyQualityCapableMatch = true;
                 string? islandArea = GetIslandArea(location.Name);
-                AddMatchingItems(islandArea != null ? IslandKeyPrefix + islandArea : label, chest, matches);
-                float distance = GetPlaceSortKey(location, position, playerLocation, playerTile, playerMapWeight);
+                string placeKey = islandArea != null ? IslandKeyPrefix + islandArea : label;
+                AddMatchingItems(placeKey, chest, matches);
+                RecordContainerKind(placeKey, chest, matches);
+                float distance = GetPlaceSortKey(location, position, playerLocation, playerTile, playerMapWeight, reach);
                 if (islandArea != null)
                 {
                     islandCounts[islandArea] = islandCounts.GetValueOrDefault(islandArea) + 1;
@@ -3348,10 +4466,9 @@ namespace ChestItemFinder
                 }
                 else
                 {
-                    string emptyLabel = emptyTerms.Count == 1
-                        ? (IsCategoryWord(emptyTerms[0]) ? " (category)" : "")
-                        : (emptyTerms.Any(IsCategoryWord) ? " (categories)" : "");
-                    notifyTitle = BuildQuotedTitle("No items found in your chests for ", emptyTerms, shorten: true, emptyLabel + ".", invalidTerms);
+                    var (emptyOrdered, emptyLabelAfter, emptyMidLabel, emptyEndLabel) = LabelCategories(emptyTerms);
+                    notifyTitle = BuildQuotedTitle("No items found in your chests for ", emptyOrdered, shorten: true, emptyEndLabel + ".", invalidTerms,
+                        labelAfter: emptyLabelAfter, midLabel: emptyMidLabel);
                 }
                 notifyBody = "";
                 resultFailed = true;         // the warning icon at the left end of the title row
@@ -3376,19 +4493,20 @@ namespace ChestItemFinder
                 // Something was found, so the search is a success, however many of the words found nothing. The title lists the words that found
                 // something, each in its own quotes and bold; the words that found nothing (or could not be searched) follow in dark red:
                 // Found 15 chests containing 'fruit' (Invalid: 'ere', 'df')
-                string chestWord = found == 1 ? "chest" : "chests";
+                string chestWord = ContainerWord(highlightedChests.Select(h => h.chest).ToList());   // "fridge(s)" if only fridges were found, else "chest(s)"
                 string foundPrefix = $"Found {found} {chestWord} containing ";
                 // a single category search ("fish", "fruit", "artisan goods" ...) gets the same " (category)" label as the auto-complete, after the
                 // closing quote: 'fish' (category); a real item name gets none. With several words the title lists them, each in its own quotes and
                 // bold, and if at least one of them is a category the title gets ONE " (categories)" (a label after every word would make
                 // the title too long): Found 15 chests containing 'fruit', 'fish' (categories)
-                string categoryLabel = validTerms.Count == 1
-                    ? (IsCategoryWord(validTerms[0]) ? " (category)" : "")
-                    : (validTerms.Any(IsCategoryWord) ? " (categories)" : "");
-                notifyTitle = BuildQuotedTitle(foundPrefix, validTerms, shorten: false, categoryLabel, invalidTerms, noItemCategoryTerms, noItemNameTerms);
-                notifyBody = BuildPlaceSummary(mainCounts, islandCounts, mainDistances, islandDistances);
+                // only the categories carry the label: 'egg', 'fish' (categories), 'Strawberry' (see LabelCategories)
+                var (orderedTerms, labelAfter, midLabel, endLabel) = LabelCategories(validTerms);
+                notifyTitle = BuildQuotedTitle(foundPrefix, orderedTerms, shorten: false, endLabel, invalidTerms, noItemCategoryTerms, noItemNameTerms,
+                    labelAfter, midLabel);
+                notifyBody = BuildPlaceSummary(mainCounts, islandCounts, mainDistances, islandDistances, PlaceNote, area => PlaceNote(IslandKeyPrefix + area));
+                placeItemOrder = BuildPlaceItemOrder(terms, termMatchers, allItems);
                 highlightLabel = string.Join(", ", validTerms.Take(3).Select(t => "'" + StripCategorySuffix(t) + "'")) + (validTerms.Count > 3 ? ", ..." : "");
-                placeEntries = ParsePlaceEntries(notifyBody);
+                placeEntries = ParsePlaceEntries(notifyBody, name => placeItems.ContainsKey(name));
                 PlaySearchFeedback(true);    // found: coin + pick-up sounds and a few gold stars beside the panel
             }
 
@@ -3412,7 +4530,9 @@ namespace ChestItemFinder
         private object? catalogBuiltFromObjectData;
         private LocalizedContentManager.LanguageCode catalogBuiltLanguage;
 
-        private static readonly HashSet<string> CatalogItemTypes = new() { "(O)", "(BC)", "(F)", "(H)", "(W)", "(T)", "(B)", "(TR)" };
+        // every kind of item a chest can hold (the same kinds as the suggestion word list, SuggestionIndex.IncludedItemTypes): clothing, mannequins,
+        // wallpaper and flooring included, so "has this item a star?" and the "Showing results for:" tips know them too
+        private static readonly HashSet<string> CatalogItemTypes = new() { "(O)", "(BC)", "(F)", "(H)", "(W)", "(T)", "(B)", "(TR)", "(S)", "(P)", "(M)", "(WP)", "(FL)" };
 
         private List<Item> GetGameItemCatalog()
         {
@@ -3452,6 +4572,59 @@ namespace ChestItemFinder
         /// True if the search words match at least one item the game has, and NONE of the matched items can carry a star (same matching rules as the
         /// real search, run over the game's item list instead of the chests). Any problem or no match at all = false (the normal star icon is kept).
         /// </summary>
+        /// <summary>
+        /// For the star button of the search menu, while the player is still typing: does this search text only name items that never have
+        /// quality ("bridal shirt", "wood")? The same rule as the result panel's "This item has no quality." for a search that found nothing:
+        /// decided by the game's own item list, with the quality words taken out and at most three words, like the search itself.
+        /// Returns null when the star does apply (or nothing is known yet); otherwise the item's name when the text names exactly one item
+        /// ("Bridal Shirt"), or "" when it names several (a category, two words ...).
+        /// </summary>
+        internal string? TextRefersOnlyToNoQualityItems(string text)
+        {
+            try
+            {
+                string query = NormalizeQueryText(SearchMenu.ExtractQuality(text ?? "", out _, out _, out _));
+                if (query.Length == 0)
+                    return null;
+
+                List<Item> catalog = GetGameItemCatalog();
+                if (catalog.Count == 0)
+                    return null;
+
+                List<string> terms = ResolveAllTerms(catalog, query).Take(MaxSearchTerms).ToList();
+                if (terms.Count == 0 || (terms.Count == 1 && !SearchMenu.IsTermSearchable(terms[0])))
+                    return null;   // not a word that can be searched (yet): no extra line
+
+                var matchers = new Func<Item, bool>[terms.Count];
+                for (int t = 0; t < terms.Count; t++)
+                {
+                    bool searchable = terms.Count == 1 || SearchMenu.IsTermSearchable(terms[t]);
+                    matchers[t] = searchable ? BuildSingleMatcher(catalog, terms[t]) : (_ => false);
+                }
+                Func<Item, bool> combined = CombineMatchers(matchers);
+
+                var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (Item item in catalog)
+                {
+                    if (!combined(item))
+                        continue;
+                    if (CanHaveQuality(item))
+                        return null;   // something it names can have a star: the star applies
+                    string name = GetShownItemName(item);
+                    names.Add(string.IsNullOrWhiteSpace(name) ? item.DisplayName : name);
+                }
+
+                if (names.Count == 0)
+                    return null;
+                return names.Count == 1 ? names.First() : "";
+            }
+            catch (Exception ex)
+            {
+                Monitor.Log($"Could not check the search text for quality: {ex.Message}", LogLevel.Trace);
+                return null;
+            }
+        }
+
         private bool SearchRefersOnlyToNoQualityItems(List<string> terms)
         {
             try
@@ -3498,20 +4671,174 @@ namespace ChestItemFinder
             foreach (Item? item in chest.Items)
             {
                 if (item == null || !matches(item)) continue;
-                string name = GetShownItemName(item);
+                string name = RowKey(item);   // the item name, or name + quality (see ONE ROW PER QUALITY)
                 totals[name] = totals.GetValueOrDefault(name) + item.Stack;
                 if (!samples.ContainsKey(name))
-                    samples[name] = MakeIconSample(item);
+                    samples[name] = MakeIconSample(item, singleItemQualityRows);
             }
         }
 
+        /// <summary>
+        /// For every item name found this search: the index of the first search word that found it and its place in that word's list (the list of
+        /// its tip, which is also the drop-down's order). See placeItemOrder.
+        /// </summary>
+        private Dictionary<string, (int Term, int Position)> BuildPlaceItemOrder(List<string> terms, Func<Item, bool>[] termMatchers, List<Item> pool)
+        {
+            var order = new Dictionary<string, (int Term, int Position)>();
+            try
+            {
+                var samples = new Dictionary<string, Item>();
+                foreach (Dictionary<string, Item> placeSampleSet in placeSamples.Values)
+                {
+                    foreach (var (name, sample) in placeSampleSet)
+                        samples.TryAdd(name, sample);
+                }
+
+                var positions = new List<Dictionary<string, int>>();
+                for (int t = 0; t < terms.Count; t++)
+                {
+                    var positionOf = new Dictionary<string, int>();
+                    List<string> listed = FindMatchedEntries(terms[t], termMatchers[t], pool, out _, out _);
+                    for (int i = 0; i < listed.Count; i++)
+                        positionOf.TryAdd(Norm(listed[i]), i);
+                    positions.Add(positionOf);
+                }
+
+                foreach (var (rowKey, sample) in samples)
+                {
+                    string name = RowName(rowKey);   // quality rows share their item's place
+                    for (int t = 0; t < terms.Count; t++)
+                    {
+                        if (!termMatchers[t](sample))
+                            continue;
+                        order[name] = (t, positions[t].TryGetValue(Norm(name), out int position) ? position : int.MaxValue);
+                        break;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Monitor.Log($"Could not order the items of the places: {ex.Message}", LogLevel.Trace);
+            }
+            return order;
+        }
+
+        /// <summary>The sort key of an item line of a place list (see placeItemOrder); an item not known there comes last.</summary>
+        private (int Term, int Position) PlaceItemOrderOf(string name)
+        {
+            return placeItemOrder.TryGetValue(RowName(name), out var key) ? key : (int.MaxValue, int.MaxValue);   // a quality row: by its item
+        }
+
+        // Counts one found container by its kind for its place, and adds its matching items to the place's section of that kind.
+        private void RecordContainerKind(string placeKey, Chest chest, Func<Item, bool> matches)
+        {
+            ContainerKind kind = KindOf(chest);
+            if (!placeKindCounts.TryGetValue(placeKey, out Dictionary<ContainerKind, int>? kinds))
+                placeKindCounts[placeKey] = kinds = new Dictionary<ContainerKind, int>();
+            kinds[kind] = kinds.GetValueOrDefault(kind) + 1;
+
+            if (!placeSectionItems.TryGetValue(placeKey, out Dictionary<string, Dictionary<string, int>>? sections))
+                placeSectionItems[placeKey] = sections = new Dictionary<string, Dictionary<string, int>>();
+            if (!sections.TryGetValue(kind.SectionKey, out Dictionary<string, int>? totals))
+                sections[kind.SectionKey] = totals = new Dictionary<string, int>();
+
+            foreach (Item? item in chest.Items)
+            {
+                if (item == null || !matches(item)) continue;
+                string name = RowKey(item);
+                totals[name] = totals.GetValueOrDefault(name) + item.Stack;
+            }
+        }
+
+        /// <summary>The kind counts of a place key; the bare island prefix adds up every Ginger Island area.</summary>
+        private Dictionary<ContainerKind, int> GetPlaceKinds(string key)
+        {
+            var result = new Dictionary<ContainerKind, int>();
+            foreach (var pair in placeKindCounts)
+            {
+                bool belongs = key == IslandKeyPrefix ? pair.Key.StartsWith(IslandKeyPrefix, StringComparison.Ordinal) : pair.Key == key;
+                if (!belongs) continue;
+                foreach (var kind in pair.Value)
+                    result[kind.Key] = result.GetValueOrDefault(kind.Key) + kind.Value;
+            }
+            return result;
+        }
+
+        /// <summary>
+        /// The bracket note of a place in the place list. It is there so a player does not walk past a container they would not think of: so it is
+        /// written only when EVERY matching container of the place is one special kind (or one family: fridge + mini-fridge). As soon as a chest
+        /// there holds the item too, the player goes in for the chest and sees every highlight anyway: no note. Any other mix: no note either.
+        /// "fridge", "mini-fridge", "mini-fridges", "fridges" (fridge + mini-fridge), "Auto-Grabbers", "Dresser" ...
+        /// </summary>
+        private string PlaceNote(string key)
+        {
+            Dictionary<ContainerKind, int> kinds = GetPlaceKinds(key);
+            if (kinds.Count == 0 || kinds.Keys.Any(k => !k.IsSpecial))
+                return "";
+            ContainerKind naming = NamingKind(kinds.Keys);
+            if (!naming.IsSpecial)
+                return "";
+            return kinds.Values.Sum() == 1 ? naming.Singular : naming.Plural;
+        }
+
+        /// <summary>
+        /// The sections of a place's item list when the place mixes kinds of containers (null when it has only one kind: then the list stays as it
+        /// always was). Chests first ("Chest" / "Chests", every size together), then the special kinds in their order ("Fridge", "Auto-Grabbers" ...).
+        /// The bare island prefix adds up every Ginger Island area.
+        /// </summary>
+        private List<(string Title, Dictionary<string, int> Items)>? GetPlaceSections(string key)
+        {
+            // section key -> (order, container count, kind for the name) and the items
+            var counts = new Dictionary<string, (int Order, int Count, ContainerKind Kind)>();
+            foreach (var kind in GetPlaceKinds(key))
+            {
+                string sectionKey = kind.Key.SectionKey;
+                ContainerKind named = kind.Key.IsSpecial ? kind.Key : ChestKind;
+                counts[sectionKey] = counts.TryGetValue(sectionKey, out var known)
+                    ? (known.Order, known.Count + kind.Value, known.Kind)
+                    : (named.Order, kind.Value, named);
+            }
+            if (counts.Count < 2)
+                return null;
+
+            var items = new Dictionary<string, Dictionary<string, int>>();
+            foreach (var pair in placeSectionItems)
+            {
+                bool belongs = key == IslandKeyPrefix ? pair.Key.StartsWith(IslandKeyPrefix, StringComparison.Ordinal) : pair.Key == key;
+                if (!belongs) continue;
+                foreach (var section in pair.Value)
+                {
+                    if (!items.TryGetValue(section.Key, out Dictionary<string, int>? totals))
+                        items[section.Key] = totals = new Dictionary<string, int>();
+                    foreach (var item in section.Value)
+                        totals[item.Key] = totals.GetValueOrDefault(item.Key) + item.Value;
+                }
+            }
+
+            static string Capitalized(string word) => word.Length > 0 ? char.ToUpperInvariant(word[0]) + word.Substring(1) : word;
+
+            return counts
+                .OrderBy(c => c.Value.Order)
+                .ThenBy(c => c.Value.Kind.Singular)
+                .Where(c => items.ContainsKey(c.Key))
+                .Select(c => (Capitalized(c.Value.Count == 1 ? c.Value.Kind.Singular : c.Value.Kind.Plural), items[c.Key]))
+                .ToList();
+        }
+
+        /// <summary>Zoom of the quality star on a 32 px item icon of the lists: 8 px sprite * 2 = 16 px (half the icon, a little larger than the game's own ratio so it reads).</summary>
+        private const float IconStarScale = 2f;
+
+        /// <summary>Sort position of a quality row: plain (0), silver (1), gold (2), iridium (4) in that order; rows without a quality first.</summary>
+        private static int QualityRowOrder(string key) => RowQuality(key);
+
         // A copy of an item that is only used to draw its icon: one piece, and no star (the line of the list adds up every quality of the item).
-        private static Item MakeIconSample(Item item)
+        // With one row per quality (keepQuality) the copy keeps its star: the row is about that quality, and the list draws the star on the icon.
+        private static Item MakeIconSample(Item item, bool keepQuality = false)
         {
             try
             {
                 Item one = item.getOne();
-                one.Quality = 0;
+                one.Quality = keepQuality ? item.Quality : 0;
                 return one;
             }
             catch (Exception)
@@ -3592,6 +4919,26 @@ namespace ChestItemFinder
                 int w = (int)Math.Round(source.Width * scale);
                 int h = (int)Math.Round(source.Height * scale);
                 var dest = new Rectangle(x + (size - w) / 2, y + (size - h) / 2, w, h);
+
+                // clothing is drawn like the game draws it: a shirt is its plain sprite plus its dye layer (the same spot in the right half of the
+                // shirt sheet, 128 px further) tinted with the shirt's color; a dyeable shirt has almost nothing in the plain sprite, so without the
+                // layer its icon was empty. Pants are their sprite tinted with their color.
+                if (item is Clothing clothing)
+                {
+                    Color dye = clothing.clothesColor.Value;
+                    if (clothing.clothesType.Value == Clothing.ClothesType.SHIRT)
+                    {
+                        b.Draw(texture, dest, source, Color.White * alpha, 0f, Vector2.Zero, SpriteEffects.None, IconLayerDepth);
+                        var dyeSource = new Rectangle(source.X + 128, source.Y, source.Width, source.Height);
+                        if (dyeSource.Right <= texture.Width)
+                            b.Draw(texture, dest, dyeSource, dye * alpha, 0f, Vector2.Zero, SpriteEffects.None, IconLayerDepth + 0.0001f);
+                    }
+                    else
+                    {
+                        b.Draw(texture, dest, source, dye * alpha, 0f, Vector2.Zero, SpriteEffects.None, IconLayerDepth);
+                    }
+                    return;
+                }
 
                 if (item is ColoredObject colored && !smokedFish)
                 {
@@ -3675,8 +5022,10 @@ namespace ChestItemFinder
         }
 
         // Splits the summary text built by BuildPlaceSummary into hoverable place words, e.g.
-        // "Farm, Cindersap Forest x3, Ginger Island (S, W x2)" -> Farm | Cindersap Forest x3 | Ginger Island | S | W x2
-        private static List<PlaceEntry> ParsePlaceEntries(string body)
+        // "Farm, Cindersap Forest x3, Ginger Island (Docks, Farm x2)" -> Farm | Cindersap Forest x3 | Ginger Island | Docks | Farm x2
+        // isPlace: true for a real place name. A part like "Farmhouse x2 (fridges)" ends with the bracket note of PlaceNote: it is only taken off
+        // when what is left is a real place, so a place whose own name ends with brackets keeps them.
+        private static List<PlaceEntry> ParsePlaceEntries(string body, Func<string, bool>? isPlace = null)
         {
             var entries = new List<PlaceEntry>();
             const string groupPrefix = "Ginger Island (";
@@ -3708,7 +5057,10 @@ namespace ChestItemFinder
                     {
                         int comma = body.IndexOf(", ", k, innerEnd - k, StringComparison.Ordinal);
                         int end = comma < 0 ? innerEnd : comma;
-                        string code = StripCount(body.Substring(k, end - k));
+                        // "Farmhouse x2: fridge" is ONE word to hover (the note belongs to its area): the area key is what stands before ": "
+                        string area = body.Substring(k, end - k);
+                        int noteAt = area.IndexOf(": ", StringComparison.Ordinal);
+                        string code = StripCount(noteAt >= 0 ? area.Substring(0, noteAt) : area);
                         entries.Add(new PlaceEntry(IslandKeyPrefix + code, "Ginger Island (" + code + ")", k, end - k));
                         k = end + 2;
                     }
@@ -3716,6 +5068,13 @@ namespace ChestItemFinder
                 else if (part.Length > 0)
                 {
                     string name = StripCount(part);
+                    int bracket = part.LastIndexOf(" (", StringComparison.Ordinal);
+                    if (isPlace != null && !isPlace(name) && bracket > 0 && part.EndsWith(")", StringComparison.Ordinal))
+                    {
+                        string withoutNote = StripCount(part.Substring(0, bracket));
+                        if (isPlace(withoutNote))
+                            name = withoutNote;   // "Farmhouse x2 (fridges)" -> "Farmhouse"
+                    }
                     entries.Add(new PlaceEntry(name, name, i, part.Length));
                 }
 
@@ -4032,6 +5391,19 @@ namespace ChestItemFinder
                     string? chosen = consensus ?? own;
                     if (IsLegalCategoryLabel(chosen))
                         name = chosen!.Trim();
+
+                    // shirts and pants: the game calls them "Clothes", the search's category is "clothing": every tip says "Clothing", like the
+                    // category the player types ("clothes" is only a hidden second spelling of it, see SingleWordCategories)
+                    if (data.Category == -100)
+                        name = CategoryDisplayName("clothing");
+
+                    // eggs and milk: the game names both (and wool, feathers ...) "Animal Product", but the search has a category word of their own.
+                    // The tip names that word first, so it matches what can be typed, and keeps the game's name in brackets: "Egg (Animal Product)"
+                    if (data.Category == -5 || data.Category == -6)
+                    {
+                        string searchWord = CategoryDisplayName(data.Category == -5 ? "egg" : "milk");
+                        name = string.IsNullOrEmpty(name) ? searchWord : $"{searchWord} ({name})";
+                    }
                 }
             }
             catch (Exception)
@@ -4106,19 +5478,14 @@ namespace ChestItemFinder
             }
         }
 
-        /// <summary>Every item in every chest, collected exactly like ScanChests does (empty chests left out, every chest once).</summary>
+        /// <summary>Every item in every chest and fridge, collected exactly like ScanChests does (every container once).</summary>
         private List<Item> GetChestItemsForTips()
         {
             var items = new List<Item>();
-            var seen = new HashSet<Chest>(ReferenceEqualityComparer.Instance);
-            foreach (var (location, _) in GetAllLocations())
+            foreach (var (_, _, chest, _) in GetAllContainers())
             {
-                foreach (var obj in location.objects.Pairs)
-                {
-                    if (obj.Value is not Chest chest || chest.Items == null || !seen.Add(chest))
-                        continue;
+                if (chest.Items != null)
                     items.AddRange(chest.Items.Where(i => i != null));
-                }
             }
             return items;
         }
@@ -4149,6 +5516,16 @@ namespace ChestItemFinder
             if (invalid)
                 return null;   // Invalid (nothing in the game matches it): no tip at all
 
+            // "Egg (item)": NOT the category tip. It says what the label does, then the item's own category, like every item tip
+            if (TryStripItemLabel(term, out string labeledItem))
+            {
+                string? itemId = FindExactItemId(labeledItem);
+                string? itemCategory = itemId != null ? GetCategoryNameForItemId(itemId) : null;
+                string kinds = Norm(labeledItem) == "egg" ? " (white and brown)" : "";   // the game has two items called "Egg"
+                string what = $"Only the item \"{labeledItem}\"{kinds}, not the whole {CategoryDisplayName(labeledItem)} category";
+                return string.IsNullOrEmpty(itemCategory) ? what : what + "\nCategory: " + itemCategory;
+            }
+
             string text = StripCategorySuffix(term ?? "").Trim();   // also "268 (Starfruit)" -> "268"
             if (text.Length == 0)
                 return null;
@@ -4177,6 +5554,25 @@ namespace ChestItemFinder
             {
                 // the same tip whether or not a chest holds something of it (an empty result still shows what the category is)
                 return $"Showing all items under the {CategoryDisplayName(text)} (category)";
+            }
+
+            // a word family ("shirt", "bed", see WORD FAMILIES): the search finds the whole family, so the tip lists it, the plain item first
+            if (IsWordFamilyName(Norm(text)))
+            {
+                HashSet<string> family = GetWordFamilyNames(Norm(text));
+                List<string> found = FindMatchedEntries(text, matchesTerm, pool, out _, out _)
+                    .Where(name => family.Contains(Norm(name)))
+                    .OrderBy(name => Norm(name) == Norm(text) ? 0 : 1)   // the plain item first, the rest in the usual order
+                    .ToList();
+                if (found.Count > 1)
+                {
+                    var familyTip = new System.Text.StringBuilder("Showing results for:");
+                    foreach (string entry in found.Take(MaxTipNames))
+                        familyTip.Append('\n').Append(entry);
+                    if (found.Count > MaxTipNames)
+                        familyTip.Append('\n').Append("... and more");
+                    return familyTip.ToString();
+                }
             }
 
             // a real item name, or a name the game builds on the fly ("Peach Wine", "Spook Fish Roe"): ALWAYS "Category: ...", never "Showing results for".
@@ -4283,10 +5679,24 @@ namespace ChestItemFinder
 
                 IEnumerable<(string Name, string? QualifiedId)>? extra = null;
                 if (matchesTerm != null && pool != null)
-                    extra = pool.Where(item => item != null && matchesTerm(item) && NameMatchesPart(item, key))
+                    extra = pool.Where(item => item != null && matchesTerm(item) && NameMatchesPart(item, text))
                                 .Select(item => (item.DisplayName, (string?)item.QualifiedItemId));
 
-                foreach (string name in suggestionIndex.GetTipNames(GetSearchVariants(text), extra))
+                // a whole category word ("wine", "fruit"): first its items in exactly the drop-down's order (the category's favourites, a built name
+                // like its ingredient: the wines in the order of the fruit), so the tip and the drop-down always list them alike
+                string plainWord = StripCategorySuffix(text);
+                if (IsCategoryWord(plainWord))
+                {
+                    foreach (Suggestion row in suggestionIndex.Search(plainWord, int.MaxValue))
+                    {
+                        if (row.IsCategory || TryStripItemLabel(row.Text, out _) || string.IsNullOrWhiteSpace(row.Text) || row.Text.StartsWith("[", StringComparison.Ordinal))
+                            continue;
+                        if (listed.Add(Norm(row.Text)))
+                            lines.Add(row.Text);
+                    }
+                }
+
+                foreach (string name in suggestionIndex.GetTipNames(GetSearchVariants(text), extra, text))
                 {
                     if (string.IsNullOrWhiteSpace(name) || name.StartsWith("[", StringComparison.Ordinal))
                         continue;
@@ -4304,12 +5714,12 @@ namespace ChestItemFinder
             return lines;
         }
 
-        /// <summary>True if the item's name (shown or internal) contains the normalized text, also in its singular / plural spelling.</summary>
-        private bool NameMatchesPart(Item item, string normText)
+        /// <summary>True if the item's name (shown or internal) contains the text word-aligned (see NameContains), also in its singular / plural spelling.</summary>
+        private bool NameMatchesPart(Item item, string text)
         {
-            foreach (string variant in GetSearchVariants(normText))
+            foreach (string variant in GetSearchVariants(text))
             {
-                if (Norm(item.DisplayName ?? "").Contains(variant, StringComparison.Ordinal) || Norm(item.Name ?? "").Contains(variant, StringComparison.Ordinal))
+                if (NameContains(item, text, variant))
                     return true;
             }
             return false;
@@ -4673,6 +6083,9 @@ namespace ChestItemFinder
             if (query.Length == 0)
                 return null;
 
+            if (TryParseMadeFrom(query, out int[] madeFrom, out DynamicCategory? madeProduct) && madeProduct != null)
+                return "made:" + string.Join(",", madeFrom.OrderBy(i => i)) + ":" + Array.IndexOf(DynamicCategories, madeProduct);
+
             if (SingleWordCategories.TryGetValue(query, out int[]? ids1))
                 return "ids:" + string.Join(",", ids1.OrderBy(i => i));
 
@@ -4706,7 +6119,10 @@ namespace ChestItemFinder
                     Func<Item, bool>? matchesTerm = null;
                     if (byName != null)
                         matchesTerm = i => byName(i) && qualityOk(i);
-                    tips.Add(BuildTermTip(term, invalidTerms.Contains(term), noItemCategoryTerms.Contains(term), matchesTerm, matchesTerm != null ? allItems : null));
+                    string? termTip = BuildTermTip(term, invalidTerms.Contains(term), noItemCategoryTerms.Contains(term), matchesTerm, matchesTerm != null ? allItems : null);
+                    if (searchAliasNotes.TryGetValue(Norm(term), out string? aliasNote))   // searched by an alias: first say that it is the same thing
+                        termTip = termTip == null ? aliasNote : aliasNote + "\n" + termTip;
+                    tips.Add(termTip);
                 }
             }
             catch (Exception ex)
@@ -5077,7 +6493,10 @@ namespace ChestItemFinder
         // would overlap, the list slides to the left until it clears the rectangle (or, with no room on the left, drops below it).
         // Header row: "Farm total: 3" (the place and the sum of all matching stacks there); then one line per item: "Starfruit ×1", "Apple ×2".
         // above: the panel is at the bottom of the screen, so the list opens ABOVE it: topY is then the list's BOTTOM edge instead of its top edge.
-        private void DrawPlaceTooltip(SpriteBatch b, string title, Dictionary<string, int> items, Dictionary<string, Item>? samples, int anchorX /* left edge of the text */, int topY, Rectangle? avoid = null, bool above = false)
+        // sections: a place that mixes kinds of containers lists its items per kind, each under a small heading ("Chest", "Fridge", "Auto-Grabbers");
+        // the same item may then appear in two sections, each with its own count. Null = one plain list, as always.
+        private void DrawPlaceTooltip(SpriteBatch b, string title, Dictionary<string, int> items, Dictionary<string, Item>? samples, int anchorX /* left edge of the text */, int topY, Rectangle? avoid = null, bool above = false,
+            List<(string Title, Dictionary<string, int> Items)>? sections = null)
         {
             const float titleScale = 0.7f;
             const int padX = 28;
@@ -5111,9 +6530,13 @@ namespace ChestItemFinder
             // "×" if the game's font has it, otherwise a plain "x" (a character the font does not have cannot be drawn)
             string times = Game1.smallFont.Characters.Contains('\u00D7') ? "\u00D7" : "x";
 
-            // most-numerous items first; if the list is too tall for the screen the rest is summarised as "+N more"
+            // in the order of the search words, and inside one word in its tip / drop-down order (see placeItemOrder); then the most numerous first.
+            // If the list is too tall for the screen the rest is summarised as "+N more"
             var ordered = items
-                .OrderByDescending(p => p.Value)
+                .OrderBy(p => PlaceItemOrderOf(p.Key).Term)
+                .ThenBy(p => PlaceItemOrderOf(p.Key).Position)
+                .ThenBy(p => QualityRowOrder(p.Key))   // one row per quality: plain, silver, gold, iridium
+                .ThenByDescending(p => p.Value)
                 .ThenBy(p => p.Key, StringComparer.CurrentCultureIgnoreCase)
                 .ToList();
 
@@ -5127,11 +6550,37 @@ namespace ChestItemFinder
                 Item? icon = null;
                 if (samples != null)
                     samples.TryGetValue(pair.Key, out icon);
-                return (FitText(pair.Key, nameRoom, Game1.smallFont) + countText, icon);
+                return (FitText(RowName(pair.Key), nameRoom, Game1.smallFont) + countText, icon);   // a quality row shows just the item name (its star is on the icon)
             }
 
             var lines = new List<(string Text, Item? Icon)>();
-            if (ordered.Count <= maxLines)
+            var headings = new HashSet<int>();   // indexes of the lines that are section headings
+            if (sections != null && sections.Count > 1)
+            {
+                // per section: its heading, then its items (most numerous first); if everything does not fit, the rest is "+N more" (items only)
+                var all = new List<(string Text, Item? Icon, bool Heading)>();
+                foreach (var (sectionTitle, sectionItems) in sections)
+                {
+                    all.Add((sectionTitle, null, true));
+                    foreach (var pair in sectionItems.OrderBy(p => PlaceItemOrderOf(p.Key).Term).ThenBy(p => PlaceItemOrderOf(p.Key).Position)
+                                 .ThenBy(p => QualityRowOrder(p.Key)).ThenByDescending(p => p.Value).ThenBy(p => p.Key, StringComparer.CurrentCultureIgnoreCase))
+                    {
+                        var line = MakeLine(pair);
+                        all.Add((line.Text, line.Icon, false));
+                    }
+                }
+
+                int shown = all.Count <= maxLines ? all.Count : maxLines - 1;
+                for (int i = 0; i < shown; i++)
+                {
+                    if (all[i].Heading)
+                        headings.Add(lines.Count);
+                    lines.Add((all[i].Text, all[i].Icon));
+                }
+                if (shown < all.Count)
+                    lines.Add(($"+{all.Skip(shown).Count(l => !l.Heading)} more", null));
+            }
+            else if (ordered.Count <= maxLines)
             {
                 lines.AddRange(ordered.Select(MakeLine));
             }
@@ -5162,6 +6611,7 @@ namespace ChestItemFinder
                         : keepRect.Bottom + KeepBoxPanelGap;         // no room on the left (a tiny window): go below the box instead
             }
 
+            placeTooltipBounds = new Rectangle(boxX, boxY, boxWidth, boxHeight);   // the edge arrow hides only if it would lie on this list
             IClickableMenu.drawTextureBox(b, Game1.menuTexture, new Rectangle(0, 256, 60, 60), boxX, boxY, boxWidth, boxHeight, Color.White);
 
             Vector2 textPos = new Vector2(boxX + padX, boxY + padY);
@@ -5172,10 +6622,26 @@ namespace ChestItemFinder
 
             int lineX = (int)textPos.X;
             int lineY = dividerY + dividerHeight + gapDividerToList;
-            foreach (var line in lines)
+            for (int index = 0; index < lines.Count; index++)
             {
+                var line = lines[index];
+                if (headings.Contains(index))
+                {
+                    // a section heading: at the left edge (no icon slot), a little lighter than the items, so the items stay the main thing
+                    Utility.drawTextWithShadow(b, line.Text, Game1.smallFont, new Vector2(lineX, CenteredTextY(Game1.smallFont, lineY, lineHeight)), Game1.textColor * 0.7f);
+                    lineY += lineHeight;
+                    continue;
+                }
+
                 if (line.Icon != null)
-                    DrawItemIcon(b, line.Icon, lineX, lineY + (lineHeight - iconSize) / 2, iconSize);
+                {
+                    int iconY = lineY + (lineHeight - iconSize) / 2;
+                    DrawItemIcon(b, line.Icon, lineX, iconY, iconSize);
+
+                    // one row per quality: the star in the icon's lower left corner, like the game's inventory (only these samples keep a star)
+                    if (SearchMenu.HasStarSprite(line.Icon.Quality))
+                        SearchMenu.DrawQualityStar(b, new Vector2(lineX - 2, iconY + iconSize - 8 * IconStarScale + 2), line.Icon.Quality, IconStarScale);
+                }
 
                 Utility.drawTextWithShadow(b, line.Text, Game1.smallFont, new Vector2(lineX + iconSlot, CenteredTextY(Game1.smallFont, lineY, lineHeight)), Game1.textColor);
                 lineY += lineHeight;
@@ -5210,6 +6676,10 @@ namespace ChestItemFinder
 
         private const string KeepBoxLabel = "Keep highlights";
         private const string KeepBoxTip = "Check to keep highlights on; uncheck to clear.";
+        private const string KeepBoxNothingTip = "Nothing left to keep.";   // unchecked, and the highlights are already gone (expired, or the found chest was opened)
+
+        /// <summary>Unchecked and nothing is highlighted any more: checking the box would keep nothing, so it does not react (see KeepBoxNothingTip).</summary>
+        private bool KeepBoxHasNothingToKeep => !keepBoxDismissed && !IsKeepHighlightsLocked && highlightedChests.Count == 0;
 
         // the game's own checkbox sprites (the ones its options menu uses), in Game1.mouseCursors
         private static readonly Rectangle CheckboxEmptySource = new(227, 425, 9, 9);
@@ -5405,7 +6875,7 @@ namespace ChestItemFinder
             IClickableMenu.drawTextureBox(b, Game1.menuTexture, new Rectangle(0, 256, 60, 60), keepBoxBounds.X, keepBoxBounds.Y, keepBoxBounds.Width, keepBoxBounds.Height, Color.White * alpha);
 
             // the mouse is over the checkbox itself: a soft highlight behind it (the words are not clickable, so they get none)
-            if (keepBoxBounds.Contains(mouse))   // the whole box is clickable: hovering any part of it lights the checkbox
+            if (keepBoxBounds.Contains(mouse) && !KeepBoxHasNothingToKeep)   // the whole box is clickable: hovering any part of it lights the checkbox (not when there is nothing to keep)
                 b.Draw(Game1.staminaRect, keepCheckHit, Game1.textColor * 0.12f * alpha);
 
             b.Draw(
@@ -5427,18 +6897,19 @@ namespace ChestItemFinder
             // The game puts a tip 32 px right of the mouse (using the old mouse position); the x offset moves it back so that its left edge
             // lies exactly on the left edge of the box, whatever part of the box the mouse is over.
             if (keepBoxBounds.Contains(mouse))
-                IClickableMenu.drawHoverText(b, KeepBoxTip, Game1.smallFont, xOffset: keepBoxBounds.X - (Game1.getOldMouseX() + 32));
+                IClickableMenu.drawHoverText(b, KeepBoxHasNothingToKeep ? KeepBoxNothingTip : KeepBoxTip, Game1.smallFont, xOffset: keepBoxBounds.X - (Game1.getOldMouseX() + 32));
         }
 
         // A left click anywhere on the box (the checkbox or the words "Keep highlights") flips it, and the click is swallowed, so it does not also
-        // swing a tool or interact with whatever lies under the box.
+        // swing a tool or interact with whatever lies under the box. With a controller, the A button does the same while the cursor is on the box
+        // (and is swallowed too, so it does not also open a chest or talk to someone behind the box).
         // The mouse is read in UI coordinates (getMousePosition(true)): the box is drawn by the HUD, which uses the UI scale. The plain
-        // getMousePosition() uses the world zoom in this event, so whenever Zoom Level and UI Scale differed the click missed the box (1.6.1 fix).
+        // getMousePosition() uses the world zoom in this event, so whenever Zoom Level and UI Scale differed the click missed the box (fixed in 1.6.1).
         private void OnKeepBoxClicked(object? sender, ButtonPressedEventArgs e)
         {
             if (IsHudClickTaken(e.Button))
                 return;   // the "Copy" bubble used this click
-            if (e.Button != SButton.MouseLeft)
+            if (e.Button != SButton.MouseLeft && e.Button != SButton.ControllerA)
                 return;
             if (!Context.IsWorldReady || Game1.activeClickableMenu != null)
                 return;
@@ -5651,7 +7122,14 @@ namespace ChestItemFinder
             List<(ResultAction Action, string Label, int Width)> actionButtons = GetResultActionButtons();
             int actionRowWidth = actionButtons.Count == 0 ? 0 : actionButtons.Sum(a => a.Width) + ResultActionGap * (actionButtons.Count - 1);
 
-            int textWidth = (int)Math.Max(Math.Max(Math.Max(titleSize.X + iconReserve + leftReserve, bodySize.X), suggestionRowWidth), actionRowWidth);
+            // the last line, when the search left words out (see AT MOST THREE AT A TIME): grey, part of the panel, so it never covers anything
+            string limitNote = lastIgnoredTerms.Count > 0
+                ? Game1.parseText($"Only {MaxSearchTerms} at a time: {string.Join(", ", lastIgnoredTerms.Select(t => "\"" + t + "\""))} "
+                    + (lastIgnoredTerms.Count == 1 ? "was" : "were") + " not searched.", Game1.smallFont, maxTextWidth)
+                : "";
+            Vector2 limitNoteSize = limitNote.Length > 0 ? Game1.smallFont.MeasureString(limitNote) : Vector2.Zero;
+
+            int textWidth = (int)Math.Max(Math.Max(Math.Max(Math.Max(titleSize.X + iconReserve + leftReserve, bodySize.X), suggestionRowWidth), actionRowWidth), limitNoteSize.X);
             int boxWidth = textWidth + padX * 2;
             int boxHeight = (int)titleSize.Y + padY * 2;
             if (body.Length > 0)
@@ -5660,6 +7138,8 @@ namespace ChestItemFinder
             boxHeight += suggestionBlockHeight;
             int actionBlockHeight = actionButtons.Count > 0 ? gap + ResultActionHeight + 4 : 0;   // a little air, then the buttons (they have their own frame, no divider)
             boxHeight += actionBlockHeight;
+            int limitNoteHeight = limitNote.Length > 0 ? gap + (int)limitNoteSize.Y : 0;           // the "Only 3 at a time" line, the very last one
+            boxHeight += limitNoteHeight;
 
             int boxX = (screenWidth - boxWidth) / 2;
 
@@ -5684,7 +7164,7 @@ namespace ChestItemFinder
                 && (panelVisible || IsKeepHighlightsLocked || keepBoxFading)
                 && IsKeepBoxHudVisible();
             if (showKeepBox)
-                LayoutKeepBox(boxX, boxY, boxWidth, boxHeight, panelAtBottom, panelVisible ? closeRect : Rectangle.Empty);
+                LayoutKeepBox(boxX, boxY, boxWidth, boxHeight, panelAtBottom, panelVisible || IsKeepHighlightsLocked ? closeRect : Rectangle.Empty);   // locked: the X of a peeked panel comes back, the box stays clear of it
 
             // what the hover tip of a highlighted chest must keep out of: the panel, its red X and the "Keep highlights" box
             if (panelVisible)
@@ -5704,15 +7184,40 @@ namespace ChestItemFinder
             bool overKeepBox = showKeepBox && !keepBoxDismissed && keepBoxBounds.Contains(mouse);
 
             // PEEK: the panel has faded but "Keep highlights" is checked: the moment the mouse is on the box (this very frame, no delay) the panel is
-            // back, as it was (title, star, places), fully opaque, and the moment the mouse leaves the box it is gone again (no fade). Display only:
-            // no countdown is touched (the panel's end time and the highlights' end time stay as they are), the checkbox is not touched, and the
-            // panel's words / X do not react (the click handlers only work while the real panel is up).
-            bool peeking = !panelVisible && IsKeepHighlightsLocked && overKeepBox;
+            // back, as it was (title, star, places), fully opaque. When the mouse leaves the box it stays PeekGraceMs longer, so the mouse can move
+            // onto it: while the mouse is on the peeked panel (or back on the box) it stays, and its place words show their item lists like on the real
+            // panel. PeekGraceMs after the mouse is on neither, it is gone (no fade). Its red X hides it at once (the highlights and the checkbox stay).
+            // Nothing else is touched: no countdown (the panel's end time and the highlights' end time stay as they are), not the checkbox. Apart from
+            // that it works exactly like the real panel: the hover tips of its words and its star, and the right-click "Copy" bubble.
+            var panelRect = new Rectangle(boxX, boxY, boxWidth, boxHeight);
+            bool peeking = false;
+            if (!panelVisible && IsKeepHighlightsLocked && showKeepBox)
+            {
+                bool overPeeked = peekActive && (panelRect.Contains(mouse) || closeRect.Contains(mouse) || hudCopyBubble.IsOpen);   // an open "Copy" bubble holds it too
+                if (overKeepBox || overPeeked)
+                {
+                    peekActive = true;
+                    peekUntilMs = now + PeekGraceMs;
+                }
+                else if (peekActive && now >= peekUntilMs)
+                {
+                    peekActive = false;
+                }
+                peeking = peekActive;
+            }
+            else
+            {
+                peekActive = false;
+            }
+
             bool panelShown = panelVisible || peeking;
+            bool overPeekPanel = peeking && panelRect.Contains(mouse);
+            bool overPeekClose = peeking && closeRect.Contains(mouse);
             if (peeking)
             {
                 alpha = 1f;
-                hudBlockRects.Add(new Rectangle(boxX, boxY, boxWidth, boxHeight));   // the hover tip of a chest keeps out of the peeked panel too
+                hudBlockRects.Add(panelRect);   // the hover tip of a chest keeps out of the peeked panel too
+                hudBlockRects.Add(closeRect);
             }
 
             // a FADING box: hovering it (clicking is not needed) freezes its own countdown and shows it fully opaque again, like the result
@@ -5720,7 +7225,7 @@ namespace ChestItemFinder
             bool overFadingKeepBox = keepBoxFading && showKeepBox && keepBoxBounds.Contains(mouse);
             if (overFadingKeepBox)
                 keepFadeUntilMs += frameDelta;
-            if (hudCopyBubble.IsOpen && !panelVisible)
+            if (hudCopyBubble.IsOpen && !panelVisible && !peeking)
                 hudCopyBubble.Close();   // the panel is gone (closed with its X): so is the bubble of its words
             if (panelVisible && (overPanel || overKeepBox || hudCopyBubble.IsOpen))   // a panel that is already gone is never revived by hovering the locked box; an open "Copy" bubble holds it like the mouse does
             {
@@ -5735,7 +7240,7 @@ namespace ChestItemFinder
                     highlightUntilMs += frameDelta;
             }
 
-            (string Title, Dictionary<string, int> Items, Dictionary<string, Item>? Samples, int AnchorX)? pendingTooltip = null;   // drawn after the keep box, see below
+            (string Title, Dictionary<string, int> Items, Dictionary<string, Item>? Samples, int AnchorX, List<(string Title, Dictionary<string, int> Items)>? Sections)? pendingTooltip = null;   // drawn after the keep box, see below
             Rectangle qualityIconBounds = Rectangle.Empty;   // where the quality icon is on screen (for its hover tip)
             string? pendingTitleTip = null;                  // hover tip of the title word under the mouse (drawn last, see below)
 
@@ -5754,7 +7259,8 @@ namespace ChestItemFinder
                 // hovering a quoted word of the title: only the hover tip (drawn last, see below). No underline: the words are display only, not links.
                 // The word under the mouse is also kept for a right click ("Copy" bubble, see OnHudCopyInput).
                 hoveredTitleTerm = null;
-                if (overPanel && !overKeepBox && !overClose && TryGetHoveredTitleWord(title, titlePos, titleScale, mouse, out int hoveredWord, out _))
+                // a peeked panel (see PEEK) works exactly like the real one: hover tips and the right-click "Copy" bubble too
+                if ((overPanel || overPeekPanel) && !overKeepBox && !overClose && !overPeekClose && TryGetHoveredTitleWord(title, titlePos, titleScale, mouse, out int hoveredWord, out _))
                 {
                     if (!hudCopyBubble.IsOpen)
                         pendingTitleTip = notifyEmphasisTips[hoveredWord];
@@ -5765,12 +7271,13 @@ namespace ChestItemFinder
                     }
                 }
 
-                // the red X outside the panel's top right corner (closes the panel, see OnResultCloseClicked); not on a peeked panel, there is nothing to close
-                if (panelVisible)
+                // the red X outside the panel's top right corner (closes the panel, see OnResultCloseClicked); on a peeked panel it hides the peek
+                if (panelShown)
                 {
                     resultCloseBounds = closeRect;
-                    DrawResultCloseButton(b, resultCloseBounds, overClose, alpha);
+                    DrawResultCloseButton(b, resultCloseBounds, overClose || overPeekClose, alpha);
                     resultCloseDrawnMs = now;
+                    resultCloseIsPeek = peeking;
                 }
 
                 // the quality icon: right end of the title row, inside the panel's frame, centered on the first title line (display only)
@@ -5806,11 +7313,18 @@ namespace ChestItemFinder
                         alpha);
                 }
 
+                // the "Only 3 at a time" line at the very bottom (grey: a note, not an error)
+                if (limitNote.Length > 0)
+                {
+                    var notePos = new Vector2(boxX + padX, boxY + boxHeight - padY - limitNoteSize.Y + 4);
+                    Utility.drawTextWithShadow(b, limitNote, Game1.smallFont, notePos, Game1.textColor * 0.6f * alpha);
+                }
+
                 // the buttons of a failed search: bottom of the panel, from the left, the game's own button frame (brighter while hovered)
                 resultActionHitBoxes.Clear();
                 if (actionButtons.Count > 0)
                 {
-                    int buttonY = boxY + boxHeight - padY - ResultActionHeight + 4;
+                    int buttonY = boxY + boxHeight - padY - limitNoteHeight - ResultActionHeight + 4;
                     int buttonX = boxX + padX;
                     foreach (var (action, label, width) in actionButtons)
                     {
@@ -5878,7 +7392,7 @@ namespace ChestItemFinder
                     Utility.drawTextWithShadow(b, body, Game1.smallFont, bodyPos, Game1.textColor * alpha);
 
                     // hovering a place word: underline it and show what was found there
-                    if (overPanel && TryGetHoveredPlace(body, bodyPos, mouse, out PlaceEntry hovered, out List<Rectangle> pieces))
+                    if ((overPanel || overPeekPanel) && TryGetHoveredPlace(body, bodyPos, mouse, out PlaceEntry hovered, out List<Rectangle> pieces))
                     {
                         Dictionary<string, int>? items = GetPlaceItems(hovered.Key);
                         if (items != null && pieces.Count > 0)
@@ -5886,7 +7400,7 @@ namespace ChestItemFinder
                             foreach (Rectangle piece in pieces)
                                 b.Draw(Game1.staminaRect, new Rectangle(piece.X, piece.Bottom - 4, piece.Width, 2), Game1.textColor * 0.8f);
 
-                            pendingTooltip = (hovered.Title, items, GetPlaceSamples(hovered.Key), pieces[0].X);
+                            pendingTooltip = (hovered.Title, items, GetPlaceSamples(hovered.Key), pieces[0].X, GetPlaceSections(hovered.Key));
                         }
                     }
                 }
@@ -5913,12 +7427,13 @@ namespace ChestItemFinder
             {
                 var tip = pendingTooltip.Value;
                 Rectangle? keepAvoid = showKeepBox ? keepBoxBounds : (Rectangle?)null;
-                DrawPlaceTooltip(b, tip.Title, tip.Items, tip.Samples, tip.AnchorX, panelAtBottom ? boxY - 8 : boxY + boxHeight + 8, keepAvoid, panelAtBottom);
+                DrawPlaceTooltip(b, tip.Title, tip.Items, tip.Samples, tip.AnchorX, panelAtBottom ? boxY - 8 : boxY + boxHeight + 8, keepAvoid, panelAtBottom, tip.Sections);
+                placeTooltipShownTick = Game1.ticks;   // the edge arrow stays off this list while it is up (see DrawEdgeArrow)
             }
 
             // hovering the quality icon: the game's own hover tip names the filter (drawn last, so it lies on top of everything else).
             // The mouse over the icon is also over the panel, so the countdown is paused like anywhere else on the panel.
-            if (panelVisible && qualityIconBounds.Contains(mouse))
+            if (panelShown && qualityIconBounds.Contains(mouse))
                 IClickableMenu.drawHoverText(b, resultHasNoQualityItemsOnly ? NoQualityItemTip : GetQualityTip(resultQuality), Game1.smallFont);
             else if (pendingTitleTip != null && !qualityIconBounds.Contains(mouse))
                 DrawTitleWordTip(b, pendingTitleTip, showKeepBox ? keepBoxBounds : (Rectangle?)null);   // follows the mouse, never covers the "Keep highlights" box
@@ -5979,9 +7494,17 @@ namespace ChestItemFinder
                 }
                 else
                 {
-                    // a left click: "Copy" copies, anywhere else closes; a right click closes it (and may open a new one on another word, below)
+                    // a left click: "Copy" copies, anywhere else closes; a right click closes it (and may open a new one on another word, below).
+                    // A left click on the result panel, its red X or the "Keep highlights" box (hudBlockRects) closes the bubble AND still does its
+                    // own job in the same click (the X closes, the box is checked ...): no second click needed. Only a click out in the world is
+                    // used up, so closing the bubble never swings a tool.
                     if (e.Button == SButton.MouseLeft)
                     {
+                        if (!hudCopyBubble.IsOverButton(mouse.X, mouse.Y) && hudBlockRects.Any(r => r.Contains(mouse)))
+                        {
+                            hudCopyBubble.Close();
+                            return;   // not taken: the handlers below (OnKeepBoxClicked, OnResultCloseClicked ...) get this click
+                        }
                         hudCopyBubble.HandleLeftClick(mouse.X, mouse.Y);
                         TakeHudClick(e.Button);
                         return;
@@ -5990,7 +7513,7 @@ namespace ChestItemFinder
                 }
             }
 
-            if (e.Button == SButton.MouseRight && now < notifyUntilMs && hoveredTitleTerm != null && now - hoveredTitleTermMs <= HudCopyFreshMs)
+            if (e.Button == SButton.MouseRight && (now < notifyUntilMs || peekActive) && hoveredTitleTerm != null && now - hoveredTitleTermMs <= HudCopyFreshMs)
             {
                 hudCopyBubble.Open(hoveredTitleTerm, mouse.X, mouse.Y);
                 Game1.playSound("smallSelect");
@@ -6030,37 +7553,42 @@ namespace ChestItemFinder
                 int tileY = (int)Math.Floor((worldMouse.Y + Game1.viewport.Y) / 64f);
 
                 Chest? hoveredChest = null;
+                Vector2 hoveredPosition = Vector2.Zero;
+                var mouseTile = new Point(tileX, tileY);
                 foreach (var (location, position, chest) in highlightedChests)
                 {
-                    if (location == Game1.currentLocation && (int)position.X == tileX && (int)position.Y == tileY)
+                    // any tile of the container counts: both halves of a fridge, every tile of a building or a dresser
+                    if (location == Game1.currentLocation && FootprintOf(chest, position).Contains(mouseTile))
                     {
                         hoveredChest = chest;
+                        hoveredPosition = position;
                         break;
                     }
                 }
 
-                if (hoveredChest == null || hoveredChest.Items == null)
+                if (hoveredChest == null)
                     return;
 
-                // what THIS chest holds of the search: item name -> total stack (all qualities added up), like the place list
+                // what THIS container holds of the search: item name -> total stack (all qualities added up), like the place list
                 var totals = new Dictionary<string, int>();
                 var samples = new Dictionary<string, Item>();
-                foreach (Item? item in hoveredChest.Items)
+                foreach (Item item in CurrentItems(hoveredChest))
                 {
-                    if (item == null || !matcher(item))
+                    if (!matcher(item))
                         continue;
 
-                    string name = GetShownItemName(item);
+                    string name = RowKey(item);   // the item name, or name + quality (see ONE ROW PER QUALITY)
                     totals[name] = totals.GetValueOrDefault(name) + item.Stack;
                     if (!chestTipSamples.TryGetValue(name, out Item? sample))
-                        chestTipSamples[name] = sample = MakeIconSample(item);
+                        chestTipSamples[name] = sample = MakeIconSample(item, singleItemQualityRows);
                     samples[name] = sample;
                 }
 
                 if (totals.Count == 0)
                     return;
 
-                string title = string.IsNullOrWhiteSpace(hoveredChest.DisplayName) ? "Chest" : hoveredChest.DisplayName;
+                // the tip's title: the container's own full name ("Chest", "Big Chest", "Fridge", "Mini-Fridge", "Auto-Grabber", "Mill", "Retro Dresser" ...)
+                string title = InfoOf(hoveredChest, hoveredPosition).FullName;
 
                 // right of and below the cursor (the game's own spot); in the lower part of the screen it opens above the cursor instead
                 bool above = uiMouse.Y > Game1.uiViewport.Height * 0.6f;
@@ -6105,15 +7633,17 @@ namespace ChestItemFinder
             float alpha = peak * (0.4f + pulse * 0.6f);
             Color baseColor = HighlightColors.TryGetValue(Config.HighlightColor ?? "", out Color chosen) ? chosen : Color.Yellow;
 
-            foreach (var (location, position, _) in highlightedChests)
+            foreach (var (location, position, chest) in highlightedChests)
             {
                 if (location != Game1.currentLocation) continue;
 
-                Vector2 screenPos = Game1.GlobalToLocal(Game1.viewport, position * 64f);
+                // the flash covers the container's whole footprint: one tile for a chest, both halves of a fridge, every tile of a building / dresser
+                Rectangle area = FootprintPixels(chest, position);
+                Vector2 screenPos = Game1.GlobalToLocal(Game1.viewport, new Vector2(area.X, area.Y));
 
                 e.SpriteBatch.Draw(
                     Game1.fadeToBlackRect,
-                    new Rectangle((int)screenPos.X - 4, (int)screenPos.Y - 4, 72, 72),
+                    new Rectangle((int)screenPos.X - 4, (int)screenPos.Y - 4, area.Width + 8, area.Height + 8),
                     baseColor * alpha
                 );
             }

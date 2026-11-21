@@ -2,7 +2,7 @@
 
 A Stardew Valley mod that tells you **which chest your item is in**.
 
-Type what you are looking for, and every chest that holds it lights up, wherever it is: on the farm, in the buildings, in town or on Ginger Island.
+Type what you are looking for, and every chest, fridge, Auto-Grabber or dresser that holds it lights up, wherever it is: on the farm, in the buildings, in town or on Ginger Island.
 
 **Download:** [Nexus Mods](https://www.nexusmods.com/stardewvalley/mods/55016)
 
@@ -26,7 +26,9 @@ Type what you are looking for, and every chest that holds it lights up, wherever
 
 Press **Left Shift + T** in game to open the search box (you can change the key in the settings).
 
-Type an item name and press **Enter**. Each chest that holds the item flashes, and a panel at the top of the screen tells you how many chests were found and where they are.
+Type an item name and press **Enter**. Each container that holds the item flashes, and a panel at the top of the screen tells you how many were found and where they are.
+
+**Searched:** every chest (big, stone, Junimo, mini-fridge ...), the fridge of the farmhouse and cabins, Auto-Grabbers, the Mill's output bin, Junimo Huts and dressers. Kegs, jars and other machines are not storage and are not searched.
 
 ### What you can search for
 
@@ -35,7 +37,10 @@ Type an item name and press **Enter**. Each chest that holds the item flashes, a
 | `starfruit` | Starfruit, and every item with "starfruit" in its name |
 | `fruit` | Every fruit (a whole category) |
 | `wine`, `jelly`, `honey` ... | Every kind of that artisan good |
-| `fruit, fish` | Fruit **or** fish (separate words with commas) |
+| `fruit wine` | Every wine made from fruit (also `vegetable juice`, `fish roe` ...) |
+| `fruit, fish` | Fruit **or** fish (separate words with commas, up to 3) |
+| `dried grape`, `honey wine` | Raisins, Mead (common names for items the game calls differently) |
+| `Egg (item)` | Only the item Egg, not the whole egg category |
 | `gold star apple` | Only gold-star apples |
 | `268` / `-79` | An item ID / a category ID |
 
@@ -43,16 +48,20 @@ Type an item name and press **Enter**. Each chest that holds the item flashes, a
 - **Typos are fine:** if nothing matches, the box suggests what you probably meant ("Did you mean: Starfruit").
 - **Star filter:** the star button next to the box filters by quality (any, silver, gold, iridium, no star). You can also type the quality, e.g. `iridium star`.
 - **History:** your last searches are shown under the box. Click one to search it again; pin the ones you use often.
+- **Names that don't exist:** type `corn jelly` and the box tells you what corn really becomes (`Corn becomes Pickled Corn in a Preserves Jar.`), with the other options to click.
+- **Singular or plural** never matters: `cranberry jelly` finds Cranberries Jelly.
 
 ### The result panel
 
-- Lists every place where the item was found, nearest first.
-- **Hover a place** to see exactly which items are there and how many.
-- **Keep highlights:** tick this box to keep the chests flashing while you walk to other maps.
+- Lists every place where the item was found, nearest first (by real walking distance).
+- **Hover a place** to see exactly which items are there and how many. Searching one item shows one row per quality, with its star.
+- **Keep highlights:** tick this box to keep the chests flashing while you walk to other maps. Hover it to bring the panel back.
 - If a chest is off screen, an **arrow** at the edge of the screen points the way.
 - Nothing in your chests? If the item is in your backpack, the panel offers **Check Backpack**.
 
 Opening a chest that holds the item clears the highlights (unless "Keep highlights" is ticked).
+
+**Controller:** press **A** on the "Keep highlights" box or on the red X of the result panel; press **B** to close the search box.
 
 ---
 
@@ -80,6 +89,18 @@ Please report it on the [Nexus Mods bugs page](https://www.nexusmods.com/stardew
 ---
 
 ## Changelog
+
+### 1.7.0
+- **More places searched:** fridges (farmhouse, cabins, island farmhouse), mini-fridges, Auto-Grabbers, the Mill's output bin, Junimo Huts and dressers.
+- **Nearest first by real walking distance**; the arrow always points to the nearest one. Ginger Island areas use the parrot-express names (Docks, Farm, Dig Site, Jungle).
+- **Clearer names:** the panel and arrows say what each container is ("2 fridges", "Auto-Grabber: Barn").
+- **Quality rows:** searching one item lists each quality on its own row, with its star.
+- **New searches:** `fruit wine`-style categories, `Egg (item)`, every shirt / bed / tank top by family name, names with brackets, up to 3 words at once.
+- **Helpful hints:** names that don't exist (`corn jelly`, `carp wine`) explain what the item really becomes; common names (`dried grape`, `honey wine`) find Raisins, Mead and more; singular / plural never matters.
+- **Auto-complete:** every storable item (clothing, mannequins, wallpaper, flooring), correct icon colors (Apple Wine is red), order matches the tooltips.
+- **Controller:** A for "Keep highlights" and the red X, B closes the search box.
+- Added legendary fish and Sea Urchin roe, smoked fish and bait; removed Wheat / Hops / Tea Leaves Juice (they don't exist).
+- Fixed: dyed shirt and pants icons, the recalled result panel now works like the normal one, the first click while the Copy bubble is open counts, and many smaller fixes.
 
 ### 1.6.1
 - Fixed: the "Keep highlights" box could not be clicked when Zoom Level and UI Scale were different.
