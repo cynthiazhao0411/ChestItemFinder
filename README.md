@@ -107,6 +107,8 @@ Please report it on the [Nexus Mods bugs page](https://www.nexusmods.com/stardew
 - The whole "Keep highlights" box is now clickable, not only the small checkbox.
 
 Earlier versions: see the [Nexus Mods page](https://www.nexusmods.com/stardewvalley/mods/55016?tab=logs).
+### 1.7.1
+- Fixed: the download included an old 1.0.0 copy of the mod in a subfolder, so mod managers (e.g. Stardrop) showed the wrong version and kept asking to update. No gameplay changes.
 
 ---
 
