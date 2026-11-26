@@ -419,7 +419,6 @@ namespace ChestItemFinder
         private static readonly HashSet<string> CategoryOnlyItemTypes = new();   // none any more: shirts and pants are in the word list like every other item
 
         private Entry[] vocabulary = Array.Empty<Entry>();
-        private HashSet<string> clutterKeys = new();          // keys of the unholdable names that are pure map clutter (Weeds, Twig, Stone): the only unholdable names the drop-down offers
         private HashSet<string> unobtainableKeys = new();      // display names of map nodes and the like (Amethyst Stone ...): not in the library, and never taken from a chest either
         private Entry[] unholdableEntries = Array.Empty<Entry>();   // Weeds, Twig, quest items ...: names the game HAS but no chest can hold (see Entry.Unholdable)
         private Dictionary<string, Entry> itemsByInternalName = new(StringComparer.OrdinalIgnoreCase);   // the game's internal English name ("Lava Eel") -> its entry: language independent, for the popular-item tables
@@ -500,7 +499,6 @@ namespace ChestItemFinder
                 return;
 
             clutterCanonicalIds = BuildClutterCanonicalIds();
-            var newClutterKeys = new HashSet<string>();
             var newUnobtainableKeys = new HashSet<string>();
 
             var byKey = new Dictionary<string, Entry>();
@@ -565,9 +563,6 @@ namespace ChestItemFinder
                                 continue;
                             }
 
-                            if (clutter)
-                                newClutterKeys.Add(unholdableKey);
-
                             string unholdableQualifiedId = clutter ? CanonicalItemId(type.Identifier + id) : type.Identifier + id;
                             if (unholdableKey.Length > 0 && (!unholdableByKey.TryGetValue(unholdableKey, out Entry prevUnholdable) || IsLowerObjectId(unholdableQualifiedId, prevUnholdable.ItemId)))
                                 unholdableByKey[unholdableKey] = new Entry(unholdableName, unholdableKey, unholdableQualifiedId, unholdable: true);
@@ -608,7 +603,6 @@ namespace ChestItemFinder
                     byKey[categoryKey] = new Entry(word, categoryKey);
             }
 
-            clutterKeys = newClutterKeys;
             unobtainableKeys = newUnobtainableKeys;
             foreach (string key in byKey.Keys)
                 unobtainableKeys.Remove(key);   // a name that a carryable item also has ("Stone") is an item
@@ -648,10 +642,11 @@ namespace ChestItemFinder
         }
 
         /// <summary>
-        /// Fish with these context tags make no roe and no targeted bait (crab pot catches). Legendary fish DO (1.6: they go into ponds, and their
+        /// Fish-type items that make no roe and no targeted bait: the plants caught in a crab pot (internal names). Crab pot SEAFOOD (Lobster, Crab,
+        /// Shrimp, Clam...) does make roe (Lobster Roe, Aged Crab Roe...) and bait, and so do legendary fish (1.6: they go into ponds, and their
         /// roe comes from treasure chests too): Legend Roe, Aged Legend Roe, Smoked Legend, Legend Bait all exist.
         /// </summary>
-        private static readonly string[] NoProcessingFishTags = { "fish_crab_pot" };
+        private static readonly HashSet<string> NoRoeFishNames = new(StringComparer.OrdinalIgnoreCase) { "Seaweed", "Green Algae", "White Algae" };
 
         /// <summary>Vegetables a keg turns into a drink of their own (Beer, Pale Ale, Green Tea): no "Wheat Juice" exists (internal names).</summary>
         private static readonly HashSet<string> KegSpecialIngredients = new(StringComparer.OrdinalIgnoreCase) { "Wheat", "Hops", "Tea Leaves" };
@@ -1204,10 +1199,11 @@ namespace ChestItemFinder
         /// are made up from the ingredients, by the same rules the machines use:
         ///   fruit        -> "{X} Wine", "{X} Jelly", "Dried {X}" (not grapes: they become raisins)
         ///   vegetable    -> "{X} Juice", "Pickled {X}"
-        ///   flower       -> "{X} Honey"
+        ///   forage       -> "Pickled {X}", "{X} Juice" (edible forage only, category -81; mushrooms are only pickled, never juiced)
+        ///   flower       -> "{X} Honey" (only flowers that are a crop's harvest: Game1.cropData; wild flowers like Sweet Pea do not make honey)
         ///   mushroom     -> "Dried {X}"   (items with the "mushroom_item" tag)
         ///   fish         -> "{X} Roe", "Aged {X} Roe" (not sturgeon: its aged roe is Caviar, an item of its own), "Smoked {X}", "{X} Bait"
-        ///                   (roe and bait: not legendary fish and not crab pot catches)
+        ///                   (roe and bait: crab pot seafood and legendary fish too; not the plants Seaweed, Green Algae, White Algae)
         /// An item can also opt in with the machine tags keg_wine / keg_juice / preserves_jelly / preserves_pickle (other mods' ingredients).
         /// X is the game's display name of the ingredient in English; in other languages the English item name is used, because the search also
         /// looks at the English name of every item. A name that already exists (real item or category word) is never replaced.
@@ -1227,6 +1223,18 @@ namespace ChestItemFinder
                 string key = MakeKey(text);
                 if (key.Length > 0 && !byKey.ContainsKey(key))
                     byKey[key] = new Entry(text, key, baseId, built: true, rankId: ingredientId);
+            }
+
+            // flowers a crop yields (Blue Jazz, Tulip, Summer Spangle, Poppy, Fairy Rose, Sunflower...): only those make honey
+            HashSet<string> cropHarvestIds = new(StringComparer.OrdinalIgnoreCase);
+            if (Game1.cropData != null)
+            {
+                foreach (var crop in Game1.cropData.Values)
+                {
+                    string? harvest = crop?.HarvestItemId;
+                    if (!string.IsNullOrEmpty(harvest))
+                        cropHarvestIds.Add(harvest.StartsWith("(O)", StringComparison.Ordinal) ? harvest.Substring(3) : harvest);
+                }
             }
 
             foreach (KeyValuePair<string, ObjectData> pair in Game1.objectData)
@@ -1249,6 +1257,8 @@ namespace ChestItemFinder
                 bool isFruit = category == -79;
                 bool isVegetable = category == -75;
                 bool isFlower = category == -80;
+                bool isForage = category == -81 && data.Edibility > 0;
+                bool isMushroom = tags.Contains("mushroom_item");
                 bool isFish = category == -4 && string.Equals(data.Type, "Fish", StringComparison.OrdinalIgnoreCase) && !NotRealFishIds.Contains(id);
 
                 if (isFruit || tags.Contains("keg_wine"))
@@ -1256,20 +1266,21 @@ namespace ChestItemFinder
                 if (isFruit || tags.Contains("preserves_jelly"))
                     Add(name + " Jelly", "(O)344");
                 // Wheat, Hops and Tea Leaves are vegetables, but a keg makes Beer, Pale Ale and Green Tea of them, never a juice
-                if ((isVegetable || tags.Contains("keg_juice")) && !KegSpecialIngredients.Contains(data.Name ?? ""))
+                if ((isVegetable || (isForage && !isMushroom) || tags.Contains("keg_juice")) && !KegSpecialIngredients.Contains(data.Name ?? ""))
                     Add(name + " Juice", "(O)350");
-                if (isVegetable || tags.Contains("preserves_pickle"))
+                if (isVegetable || isForage || tags.Contains("preserves_pickle"))
                     Add("Pickled " + name, "(O)342");
-                if (isFlower)
+                // honey: only flowers that grow from a crop (if the crop data is unavailable, every flower, as before)
+                if (isFlower && (cropHarvestIds.Count == 0 || cropHarvestIds.Contains(id)))
                     Add(name + " Honey", "(O)340");
 
                 bool isGrape = string.Equals(data.Name, "Grape", StringComparison.OrdinalIgnoreCase);
                 if (isFruit && !isGrape)
                     Add("Dried " + name, "(O)DriedFruit");
-                else if (tags.Contains("mushroom_item"))
+                else if (isMushroom)
                     Add("Dried " + name, "(O)DriedMushrooms");
 
-                if (isFish && !tags.Any(tag => Array.IndexOf(NoProcessingFishTags, tag) >= 0))
+                if (isFish && !NoRoeFishNames.Contains(data.Name ?? ""))
                 {
                     Add(name + " Roe", "(O)812");
                     if (id != "698")   // sturgeon: its aged roe is Caviar
@@ -1466,7 +1477,7 @@ namespace ChestItemFinder
 
             // the Weeds family always shows the one classic sprite
             string weedsKey = MakeKey("Weeds");
-            // forced: every Weeds variant draws the sprite of object 314 (springobjects.png), as long as that object exists in the game data
+            // forced: every Weeds variant draws the sprite of object 313 (springobjects.png), as long as that object exists in the game data
             if (lowestByName.ContainsKey(weedsKey) && Game1.objectData.ContainsKey(ClassicWeedsObjectId))
             {
                 lowestByName[weedsKey] = ClassicWeedsObjectId;
@@ -1480,36 +1491,6 @@ namespace ChestItemFinder
             }
 
             return map;
-        }
-
-        private static string? litterCategoryNameCache;
-
-        /// <summary>The name the game gives to its litter category (what a Weeds item reports as its category), or null.</summary>
-        internal static string? LitterCategoryName
-        {
-            get
-            {
-                if (litterCategoryNameCache != null)
-                    return litterCategoryNameCache;
-
-                try
-                {
-                    foreach (KeyValuePair<string, ObjectData> pair in Game1.objectData)
-                    {
-                        if (pair.Value == null || pair.Value.Category != LitterCategoryId)
-                            continue;
-                        string? name = ItemRegistry.Create("(O)" + pair.Key).getCategoryName()?.Trim();
-                        if (!string.IsNullOrEmpty(name))
-                            return litterCategoryNameCache = name;
-                    }
-                }
-                catch (Exception)
-                {
-                    // no name rather than a crash
-                }
-
-                return null;
-            }
         }
 
         /// <summary>
@@ -1807,12 +1788,6 @@ namespace ChestItemFinder
 
             SetOwnedNames(names);
             ownedCounts = counts;
-        }
-
-        /// <summary>How many of the named item the chests held when <see cref="SetOwnedItems"/> was last called (0 = none, or unknown).</summary>
-        public int GetOwnedCount(string displayName)
-        {
-            return ownedCounts.TryGetValue(MakeKey(displayName ?? ""), out int count) ? count : 0;
         }
 
         /// <summary>Remembers the names of the items that are in the player's chests right now (they are ranked first).</summary>
@@ -2312,29 +2287,6 @@ namespace ChestItemFinder
             }
 
             return rows;
-        }
-
-        /// <summary>The entries of the litter category, built from the game's object data: pure map clutter only (see <see cref="IsPureMapClutter"/>), one per name, lowest id as its icon.</summary>
-        private List<Entry> BuildLitterEntries()
-        {
-            var byKey = new Dictionary<string, Entry>();
-            foreach (KeyValuePair<string, ObjectData> pair in Game1.objectData)
-            {
-                if (pair.Value == null || !IsPureMapClutter(pair.Key, pair.Value))
-                    continue;
-
-                string qualifiedId = CanonicalItemId("(O)" + pair.Key);
-                ParsedItemData? data = ItemRegistry.GetData(qualifiedId);
-                string? name = data?.DisplayName?.Trim();
-                if (data == null || data.IsErrorItem || !IsUsableName(name))
-                    continue;
-
-                string key = MakeKey(name);
-                if (key.Length > 0 && (!byKey.TryGetValue(key, out Entry previous) || IsLowerObjectId(qualifiedId, previous.ItemId)))
-                    byKey[key] = new Entry(name, key, qualifiedId);
-            }
-
-            return byKey.Values.OrderBy(e => e.Text, StringComparer.CurrentCultureIgnoreCase).ToList();
         }
 
         // ===================== "DID YOU MEAN" JUNK BLACKLIST =====================
@@ -3377,9 +3329,6 @@ namespace ChestItemFinder
     {
         /// <summary>Tier and progress of an item the game does not know (another mod's item that is only in a chest).</summary>
         public static readonly (int Tier, int Progress) Unknown = (4, 50);
-
-        /// <summary>Tier 4 and higher are pushed to the end of every suggestion list (cooking, decoration, furniture, clothing).</summary>
-        public const int FirstDemotedTier = 4;
 
         /// <summary>Progress from which an item counts as late-game / mostly for fun (Qi Fruit, Radioactive and Prismatic items, legendary fish ...).</summary>
         public const int LateProgress = 88;

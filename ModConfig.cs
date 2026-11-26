@@ -16,7 +16,8 @@ namespace ChestItemFinder
         public int HighlightOpacityPercent { get; set; } = 60;
 
         /// <summary>
-        /// Color of the flashing chest highlight. One of: Yellow, Red, Orange, Green, Blue, Purple, Black, White, Gray, Brown.
+        /// The main color of the flashing chest highlight. One of: Yellow, Orange, Red, Pink, Purple, Blue, Sky Blue, Green, White, Black.
+        /// A search with several words uses it for the first word (see SecondaryColor1 / SecondaryColor2).
         /// </summary>
         public string HighlightColor { get; set; } = "Yellow";
 
@@ -26,5 +27,23 @@ namespace ChestItemFinder
         /// Uses the real clock, so time-speed mods do not affect it.
         /// </summary>
         public int HighlightTimeoutSeconds { get; set; } = 180;
+
+        /// <summary>
+        /// The flash colors of the second and the third word of a search with several words ("fruit, fish, gem"); the first word uses
+        /// HighlightColor (the main color). Same color names as HighlightColor.
+        /// </summary>
+        public string SecondaryColor1 { get; set; } = "Pink";
+        public string SecondaryColor2 { get; set; } = "Sky Blue";
+
+        /// <summary>
+        /// The player flashes like a chest while the backpack holds something of the search. Off = no flash on the player (hovering the player still
+        /// lists the backpack's matching items while the highlights last).
+        /// </summary>
+        public bool FlashPlayer { get; set; } = true;
+
+        /// <summary>
+        /// The red arrow with the word "Backpack" above the player's head while the backpack holds something of the search. Off = no arrow and no text.
+        /// </summary>
+        public bool ShowPlayerArrow { get; set; } = true;
     }
 }

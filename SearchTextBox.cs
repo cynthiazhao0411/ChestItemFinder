@@ -59,6 +59,12 @@ namespace ChestItemFinder
 
         private DateTime caretSolidUntil = DateTime.MinValue;
 
+        /// <summary>
+        /// Grey hint drawn inside the box while it holds no text (like the "Message Claude..." line of a chat box). It disappears as soon as
+        /// something is typed or pasted and comes back when the box is empty again. Empty = no hint. Never part of Text.
+        /// </summary>
+        public string Placeholder { get; set; } = "";
+
         private bool mouseSelecting;
 
         // a series of fast clicks on the text, counted here (like Windows): 1 = place the caret, 2 = select the word, 3 = select everything,
@@ -155,12 +161,6 @@ namespace ChestItemFinder
             anchor = 0;
             caret = Text.Length;
             EnsureCaretVisible();
-        }
-
-        public void ClearSelection()
-        {
-            Sync();
-            anchor = caret;
         }
 
         /// <summary>
@@ -544,6 +544,10 @@ namespace ChestItemFinder
                 else
                     spriteBatch.DrawString(font, shown, textPos, textColor);
             }
+
+            // the placeholder: only while the box is empty, grey, no shadow, a little right of the caret; skipped if it does not fit
+            if (text.Length == 0 && Placeholder.Length > 0 && font.MeasureString(Placeholder).X <= TextAreaWidth - 8)
+                spriteBatch.DrawString(font, Placeholder, textPos + new Vector2(8, 0), textColor * 0.45f);
 
             // the caret: solid right after typing / moving, then blinking
             DateTime now = DateTime.UtcNow;

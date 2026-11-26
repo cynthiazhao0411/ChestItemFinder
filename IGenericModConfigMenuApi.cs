@@ -21,6 +21,14 @@ namespace ChestItemFinder
             Func<string>? tooltip = null,
             string? fieldId = null);
 
+        void AddBoolOption(
+            IManifest mod,
+            Func<bool> getValue,
+            Action<bool> setValue,
+            Func<string> name,
+            Func<string>? tooltip = null,
+            string? fieldId = null);
+
         void AddKeybindList(
             IManifest mod,
             Func<KeybindList> getValue,
@@ -64,5 +72,8 @@ namespace ChestItemFinder
             int? interval = null,
             Func<int, string>? formatValue = null,
             string? fieldId = null);
+
+        /// <summary>Called when a field with a field id is changed on the page, before it is saved.</summary>
+        void OnFieldChanged(IManifest mod, Action<string, object> onChange);
     }
 }

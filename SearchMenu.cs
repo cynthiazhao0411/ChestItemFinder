@@ -117,7 +117,7 @@ namespace ChestItemFinder
         /// <summary>
         /// A small button in the game's own menu style: the same wooden menu frame as every menu and as the result panel (Game1.menuTexture, the
         /// standard 60 x 60 box), dark brown text (the game's text color) in the middle. While hovered, the inside gets a warm light glow and the
-        /// text a soft shadow lift, like the game's hovered menu buttons. Used by the "Check Backpack" button of the result panel.
+        /// text a soft shadow lift, like the game's hovered menu buttons. Used by the Copy / Paste bubble.
         /// </summary>
         internal static void DrawMenuButton(SpriteBatch b, Rectangle bounds, string label, bool hovered, float alpha = 1f)
         {
@@ -370,10 +370,9 @@ namespace ChestItemFinder
         private int multiCategoryRowCount;
         private string multiCategoryLead = "";
 
-        // the big white note above the box when a fourth word is typed ("Only 3 at a time ..."): its text, and which ignored words it was
-        // shown for (the same words are not announced twice in a row). It has no fade: it is there or gone (see UpdateCategoryNote)
+        // the big white note above the box when a fourth word is typed ("Only 3 at a time ..."): its text. It has no fade: it is there or
+        // gone (see UpdateCategoryNote)
         private string? categoryNoteText;
-        private string? categoryNoteKey;
         private bool magnifierPressStarted;   // the left button went down on the magnifier and is (possibly) still held
 
         // Instant correction ("Did you mean: Fish, Catfish" under the text box, before Enter): filled by RefreshSuggestions only when the word being typed
@@ -480,6 +479,9 @@ namespace ChestItemFinder
                 Height = 48,
                 Text = ""
             };
+
+            // grey hint inside the empty box; it disappears as soon as something is typed
+            textBox.Placeholder = "Type something to start!";
 
             starButton = new Rectangle(xPositionOnScreen + width - 48 - starSize, yPositionOnScreen + 104, starSize, starSize);
 
@@ -683,7 +685,7 @@ namespace ChestItemFinder
         /// True if the query contains a character that cannot belong to an item name: anything except letters, digits, white space,
         /// accent / vowel-sign marks and the symbols of <see cref="AllowedPunctuation"/> ("*$f", "ab@cd", "fruit#", emoji ...).
         /// Call it with the query AFTER the " (category)" label was cut off. Letters of every language count as letters, so
-        /// translated item names (Chinese, Korean, Russian, accents like "Pi�a") are fine.
+        /// translated item names (Chinese, Korean, Russian, accents like "Piña") are fine.
         /// </summary>
         private static bool HasInvalidCharacters(string plainQuery)
         {
@@ -972,21 +974,22 @@ namespace ChestItemFinder
             return false;
         }
 
-        private void Confirm()
+        /// <summary>
+        /// The checks Enter runs before a search, shared by the search box and the console command find_item, so both refuse exactly the same texts
+        /// with the same hint. Returns the red hint of a refused text, or null when it may be searched. <paramref name="query"/>: the text without its
+        /// quality words; <paramref name="qualityInText"/>: the quality typed into the text (null = none). A product the game never makes ("corn
+        /// jelly") is not checked here: see ModEntry.GetImpossibleProduct.
+        /// </summary>
+        internal static string? CheckQuery(string text, out string query, out int? qualityInText)
         {
-            // a suggestion picked with the arrow keys wins over the typed text
-            if (SuggestionsVisible && activeSuggestion >= 0 && activeSuggestion < suggestions.Count)
-                textBox.Text = ApplySuggestion(activeSuggestion);
-
+            text ??= "";
             // quality words ("gold star apple") are taken out first: the rest is the item search, the typed quality wins over the star button
-            string searchText = ExtractQuality(textBox.Text, out int? qualityInText, out bool qualityConflict, out _);
-            typedQuality = qualityInText;
-            int searchQuality = EffectiveQuality;
-            string query = searchText.Trim();
+            string searchText = ExtractQuality(text, out qualityInText, out bool qualityConflict, out _);
+            query = searchText.Trim();
 
             // the player typed something, but all of it was white space (spaces, tabs): that is not a typo that is "too short", so it gets
             // its own hint. A completely empty box (nothing typed) still gets the "too short" hint, and "  fruit  " is trimmed to "fruit" and searched normally.
-            bool blankOnly = textBox.Text.Length > 0 && query.Length == 0 && qualityInText == null;
+            bool blankOnly = text.Length > 0 && query.Length == 0 && qualityInText == null;
 
             // "fruit (category)" is the same search as "fruit": the history keeps the plain word, and the length rule looks at the plain word.
             // Words separated by commas ("fruit, fish", half-width or full-width comma) are separate search terms; the history keeps them as
@@ -1064,6 +1067,23 @@ namespace ChestItemFinder
                     : invalidCharacters ? InvalidCharactersHintText
                     : null;
             }
+
+            return refusal;
+        }
+
+        private void Confirm()
+        {
+            // a suggestion picked with the arrow keys wins over the typed text
+            if (SuggestionsVisible && activeSuggestion >= 0 && activeSuggestion < suggestions.Count)
+                textBox.Text = ApplySuggestion(activeSuggestion);
+
+            // the same checks as the console command find_item (see CheckQuery); the typed quality wins over the star button
+            string? refusal = CheckQuery(textBox.Text, out string query, out int? qualityInText);
+            typedQuality = qualityInText;
+            int searchQuality = EffectiveQuality;
+            bool hasCommas = ModEntry.HasCommas(query);
+            string plainQuery = ModEntry.NormalizeQueryText(query);
+            List<string> terms = hasCommas ? ModEntry.GetCommaTerms(query) : new List<string> { plainQuery };
 
             // a product the game never makes ("corn jelly", "carp wine", "fruit juice", see IMPOSSIBLE PRODUCT LINES): refused like the other
             // refusals (same sound, nothing searched, nothing remembered), but its two lines stay, the first one in red
@@ -1900,14 +1920,12 @@ namespace ChestItemFinder
             if (ignored.Count == 0)
             {
                 // the fourth word is gone (its last letter deleted): the note is gone at once, no fade
-                categoryNoteKey = null;
                 categoryNoteText = null;
                 return;
             }
 
             string words = string.Join(", ", ignored.Select(word => "\"" + word + "\""));
             categoryNoteText = $"Only {ModEntry.MaxSearchTerms} at a time: {words} {(ignored.Count == 1 ? "is" : "are")} ignored.";
-            categoryNoteKey = string.Join("|", ignored.Select(SuggestionIndex.MakeKey));
         }
 
         /// <summary>Draws the note of UpdateCategoryNote above the box (below it if there is no room above), while there is one.</summary>
@@ -3799,13 +3817,6 @@ namespace ChestItemFinder
             b.Draw(Game1.fadeToBlackRect, new Rectangle(0, 0, Game1.uiViewport.Width, Game1.uiViewport.Height), Color.Black * 0.5f);
 
             Game1.drawDialogueBox(xPositionOnScreen, yPositionOnScreen, width, height, false, true);
-
-            Utility.drawTextWithShadow(
-                b,
-                "Search chests for an item",
-                Game1.dialogueFont,
-                new Vector2(xPositionOnScreen + 48, yPositionOnScreen + 40),
-                Game1.textColor);
 
             DrawCategoryNote(b);
 

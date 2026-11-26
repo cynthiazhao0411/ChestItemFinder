@@ -22,6 +22,16 @@ namespace ChestItemFinder
     {
         private List<(GameLocation location, Vector2 position, Chest chest)> highlightedChests = new();
 
+        // The player's backpack is a place like any other (see BACKPACK AS A PLACE): when it holds something of the search, the player flashes like a
+        // chest. highlightBackpack = the flash is on; backpackWordSlots = the colors of the words the backpack holds (several words search, like
+        // chestWordSlots); keepSavedBackpack = the flash at the moment "Keep highlights" was unchecked (a click during the fade brings it back).
+        private bool highlightBackpack;
+        private int[] backpackWordSlots = Array.Empty<int>();
+        private bool keepSavedBackpack;
+
+        /// <summary>Something is highlighted: a chest, or the backpack (the player).</summary>
+        private bool AnyHighlight => highlightedChests.Count > 0 || highlightBackpack;
+
         // Hover tip of a highlighted chest in the world (see OnRenderedHudChestTip): the matcher of the last search (what counts as "found"), so the
         // tip can list what ONE chest holds of it, live; an icon sample per item name; and the screen rectangles of the result panel, its red X and the
         // "Keep highlights" box in the last HUD frame, which the tip must never be drawn over.
@@ -143,39 +153,122 @@ namespace ChestItemFinder
             ["IslandFarmHouse"] = "Ginger Island Farmhouse",
             ["IslandFarmCave"] = "Ginger Island Farm Cave",
             ["IslandHut"] = "Ginger Island Leo's Hut",
-            ["IslandFieldOffice"] = "Ginger Island Field Office"
+            ["IslandFieldOffice"] = "Ginger Island Field Office",
+            ["ManorHouse"] = "Mayor's Manor"
         };
 
-        // highlight colors offered in the config menu (the first one is the default)
+        // the colors offered in the config menu, as a row of boxes (see ColorSwatchPicker), left to right
         private static readonly string[] HighlightColorNames =
         {
-            "Yellow", "Red", "Orange", "Green", "Blue", "Purple", "Black", "White", "Gray", "Brown"
+            "Yellow", "Orange", "Red", "Pink", "Purple", "Blue", "Sky Blue", "Green", "White", "Black"
         };
 
+        // how every color is drawn (the flash on the chests, the marks behind the words, the words of the status line). Gold, Brown and Gray
+        // are no longer offered, but a config.json that still names them keeps working.
         private static readonly Dictionary<string, Color> HighlightColors = new(StringComparer.OrdinalIgnoreCase)
         {
             ["Yellow"] = Color.Yellow,
-            ["Red"] = Color.Red,
             ["Orange"] = Color.Orange,
-            ["Green"] = Color.LimeGreen,   // brighter than XNA's very dark Color.Green, so it shows on grass
-            ["Blue"] = Color.Blue,
+            ["Red"] = Color.Red,
+            ["Pink"] = new Color(255, 64, 192),
             ["Purple"] = Color.Purple,
-            ["Black"] = Color.Black,
+            ["Blue"] = Color.Blue,
+            ["Sky Blue"] = new Color(30, 144, 255),
+            ["Green"] = Color.LimeGreen,   // brighter than XNA's very dark Color.Green, so it shows on grass
             ["White"] = Color.White,
-            ["Gray"] = Color.Gray,
-            ["Brown"] = Color.Brown
+            ["Black"] = Color.Black,
+            ["Gold"] = new Color(255, 212, 0),
+            ["Brown"] = Color.Brown,
+            ["Gray"] = Color.Gray
         };
 
-        /// <summary>Returns the matching color name from the list above (fixing the casing), or "Yellow" if it is unknown.</summary>
-        private static string NormalizeColorName(string? name)
+        /// <summary>Returns the matching color name (fixing the casing), or the fallback ("Yellow") if it is unknown.</summary>
+        private static string NormalizeColorName(string? name, string fallback = "Yellow")
         {
             string trimmed = name?.Trim() ?? "";
-            foreach (string known in HighlightColorNames)
+            foreach (string known in HighlightColors.Keys)
             {
                 if (string.Equals(known, trimmed, StringComparison.OrdinalIgnoreCase))
                     return known;
             }
-            return "Yellow";
+            return fallback;
+        }
+
+        // ===================== SEVERAL WORDS, SEVERAL COLORS =====================
+        // A search for two or three words ("fruit, fish") gives every word that found something a flash color of its own, in the order typed:
+        // word 1 the main color (the one a one-word search uses, default Yellow), word 2 the secondary color 1 (Pink), word 3 the secondary
+        // color 2 (Sky Blue). The color of a word shows:
+        //   - on the chests that hold it (the flash). A chest that holds several words is cut into upright strips, one per word, left to right in
+        //     the order of the color numbers (word 1, 2, 3); only a strip set with all three colors is laid out as secondary 1, main, secondary 2
+        //     (default: pink, yellow, blue), see StripOrder. The colors are never mixed (yellow + blue would look green, a fourth word that was never searched);
+        //   - as a highlighter mark behind the word in the panel title, and behind the item lines of the item lists (a hovered place, a hovered
+        //     chest: an item has the color of the first word that found it). The text itself keeps the game's normal color;
+        //   - on the word itself in the status line of the lower left corner (on the world, where the bright color reads well).
+        // Every color is the same everywhere, so a word, its chests and its items are matched at a glance.
+
+        private static readonly string[] DefaultWordColors = { "Yellow", "Pink", "Sky Blue" };
+
+        /// <summary>How strong the highlighter mark behind a word or an item line is (of the panel's own fade).</summary>
+        private const float WordMarkAlpha = 0.42f;
+
+        // how many words of the last search have a color (2 or 3); 0 = a one-word search (or nothing found): one color, as always
+        private int highlightWordCount;
+
+        // per search word (index in the search's word list): its color number (0 = word 1 ...), -1 = no color (it found nothing)
+        private int[] termWordSlot = Array.Empty<int>();
+
+        // the color numbers of every highlighted chest (the words it holds, in the order typed); kept when the highlights are cleared, so a
+        // "Keep highlights" box that is checked again brings the chests back in their colors
+        private readonly Dictionary<Chest, int[]> chestWordSlots = new(ReferenceEqualityComparer.Instance);
+
+        // the words of the status line, in color order ("Highlighting: 'fruit', 'fish' (12 chests)")
+        private List<string> highlightLabelWords = new();
+
+        // the color number of every quoted word of the title (same order as notifyEmphasis; -1 = normal color), and the title it belongs to:
+        // a title built by anything else (a failed search) is never colored
+        private int[] titleEmphasisSlots = Array.Empty<int>();
+        private string coloredTitle = "";
+
+        // the color number of every item name found by the last search (see OwnerSlot in ScanChests): an item that a category word AND an item
+        // word of the same search both find ("fruit, mango": Mango) has the color of the item word, everywhere (its chests, its item line)
+        private Dictionary<string, int> itemWordSlots = new();
+
+        /// <summary>
+        /// The left-to-right order of the color strips of a chest (or of the player, the backpack): the color numbers ascending (word 1, word 2, word 3),
+        /// except a strip set that has all three colors: secondary 1, main, secondary 2 (default pink, yellow, blue). One or two colors keep the
+        /// plain order (two: main, secondary: default yellow, pink).
+        /// </summary>
+        private static int[] StripOrder(IEnumerable<int> slots)
+        {
+            int[] ordered = slots.Distinct().OrderBy(slot => slot).ToArray();
+            return ordered.Length == 3 && ordered[0] == 0 && ordered[1] == 1 && ordered[2] == 2
+                ? new[] { 1, 0, 2 }
+                : ordered;
+        }
+
+        private string WordColorName(int slot)
+        {
+            string? name = slot switch { 0 => Config.HighlightColor, 1 => Config.SecondaryColor1, 2 => Config.SecondaryColor2, _ => null };
+            return NormalizeColorName(name, DefaultWordColors[Math.Clamp(slot, 0, DefaultWordColors.Length - 1)]);
+        }
+
+        /// <summary>The flash color of a word (chests, marks, status line).</summary>
+        private Color WordFlashColor(int slot)
+        {
+            return HighlightColors.TryGetValue(WordColorName(slot), out Color color) ? color : Color.Yellow;
+        }
+
+        /// <summary>The mark behind an item line of an item list (the flash color of the first word that found the item), or null for none.</summary>
+        private Color? ItemLineMark(string rowKey)
+        {
+            if (highlightWordCount <= 0)
+                return null;
+            if (itemWordSlots.TryGetValue(RowName(rowKey), out int owner))
+                return WordFlashColor(owner) * WordMarkAlpha;
+            int term = PlaceItemOrderOf(rowKey).Term;   // an item the search did not see in a chest (put in later): the first word that found it
+            if (term < 0 || term >= termWordSlot.Length || termWordSlot[term] < 0)
+                return null;
+            return WordFlashColor(termWordSlot[term]) * WordMarkAlpha;
         }
 
         // highlight timeout choices offered in the config menu (seconds, and the text shown for each)
@@ -202,9 +295,11 @@ namespace ChestItemFinder
             Config.HighlightTimeoutSeconds = NormalizeTimeoutSeconds(Config.HighlightTimeoutSeconds);
             // opacity is 0-100 in steps of 20; fix up hand-edited config.json values
             Config.HighlightOpacityPercent = (int)Math.Round(Math.Clamp(Config.HighlightOpacityPercent, 0, 100) / 20.0) * 20;
-            Config.HighlightColor = NormalizeColorName(Config.HighlightColor);
+            Config.HighlightColor = NormalizeColorName(Config.HighlightColor, DefaultWordColors[0]);
+            Config.SecondaryColor1 = NormalizeColorName(Config.SecondaryColor1, DefaultWordColors[1]);
+            Config.SecondaryColor2 = NormalizeColorName(Config.SecondaryColor2, DefaultWordColors[2]);
 
-            helper.ConsoleCommands.Add("find_item", "Search for an item in all chests. Usage: find_item <item name>", OnFindItem);
+            helper.ConsoleCommands.Add("find_item", "Search your chests like the search box and list where everything is (place, container, tile, count, stars). " + FindItemUsage, OnFindItem);
             helper.ConsoleCommands.Add("find_item_audit", "Developer check over the whole item list: drop-down names missing from their hover tip, and item-name typos that 'Did you mean' cannot correct.", OnAudit);
 
             helper.Events.GameLoop.GameLaunched += OnGameLaunched;
@@ -218,7 +313,6 @@ namespace ChestItemFinder
             helper.Events.Input.ButtonPressed += OnKeepBoxClicked;
             helper.Events.Input.ButtonPressed += OnSuggestionClicked;
             helper.Events.Input.ButtonPressed += OnResultCloseClicked;
-            helper.Events.Input.ButtonPressed += OnResultActionClicked;   // the "Check Backpack" button of a failed search
             helper.Events.Display.RenderedWorld += OnRenderedWorld;
             helper.Events.Display.RenderedHud += OnRenderedHud;
             helper.Events.Display.RenderedHud += OnRenderedHudChestTip;   // after OnRenderedHud: its tip is drawn on top of the panel
@@ -229,9 +323,23 @@ namespace ChestItemFinder
             helper.Events.GameLoop.UpdateTicked += OnUpdateTicked;
         }
 
+        private const string SearchKeyFieldId = "SearchKey";   // GMCM field id of the search key, for OnFieldChanged
+
         // Optional integration: lets players change the key in-game via Generic Mod Config Menu.
         private void OnGameLaunched(object? sender, GameLaunchedEventArgs e)
         {
+            // a search key that clashes with a game control or another mod's key: a warning in the SMAPI console (the red lines of the config page
+            // are only seen by players with GMCM). Same rules as those lines, see KeyConflictChecker.
+            try
+            {
+                foreach (string conflict in new KeyConflictChecker(Helper, ModManifest.UniqueID).CheckNow(Config.SearchKey))
+                    Monitor.Log($"Search key ({Config.SearchKey}): {conflict} Change it in config.json or in Generic Mod Config Menu.", LogLevel.Warn);
+            }
+            catch (Exception ex)
+            {
+                Monitor.Log($"Could not check the search key for conflicts: {ex.Message}", LogLevel.Trace);
+            }
+
             var api = Helper.ModRegistry.GetApi<IGenericModConfigMenuApi>("spacechase0.GenericModConfigMenu");
             if (api == null) return;
 
@@ -241,15 +349,32 @@ namespace ChestItemFinder
                 save: () => Helper.WriteConfig(Config)
             );
 
-            api.AddSectionTitle(ModManifest, () => "ChestItemFinder");
+            api.AddSectionTitle(ModManifest, () => "General");
 
             api.AddKeybindList(
                 mod: ModManifest,
                 getValue: () => Config.SearchKey,
                 setValue: value => Config.SearchKey = value,
                 name: () => "Search key",
-                tooltip: () => "Press this key (or key combination) in-game to open the chest search box. Default: LeftShift + T."
+                tooltip: () => "Press this key (or key combination) in-game to open the chest search box. Default: LeftShift + T.",
+                fieldId: SearchKeyFieldId
             );
+
+            // red lines under the search key when it is the same key as a game control or another mod's key (nothing shown otherwise)
+            var keyConflicts = new KeyConflictChecker(Helper, ModManifest.UniqueID);
+            api.AddComplexOption(
+                mod: ModManifest,
+                name: () => "",
+                draw: keyConflicts.Draw,
+                beforeMenuOpened: () => keyConflicts.Reload(Config.SearchKey),
+                afterReset: () => keyConflicts.SetKey(Config.SearchKey),
+                height: () => keyConflicts.Height
+            );
+            api.OnFieldChanged(ModManifest, (fieldId, value) =>
+            {
+                if (fieldId == SearchKeyFieldId && value is StardewModdingAPI.Utilities.KeybindList key)
+                    keyConflicts.SetKey(key);   // check the new key at once, before it is saved
+            });
 
             // a slider that follows the mouse smoothly (the knob is not forced onto a step while dragging); the nearest of the fixed timeouts
             // is shown next to it (Never, 30 seconds, 1 minute, ...) and is what gets saved
@@ -264,7 +389,7 @@ namespace ChestItemFinder
                 mod: ModManifest,
                 name: () => "Highlight timeout",
                 draw: timeoutSlider.Draw,
-                tooltip: () => "Real-world time before chest highlights disappear by themselves. Never = they stay until you open a found chest. Not affected by in-game time speed. Default: 3 minutes.",
+                tooltip: () => "Real-world time before chest highlights disappear by themselves. Never: they stay until you open a found chest. Not affected by in-game time speed. Default: 3 minutes.",
                 beforeMenuOpened: timeoutSlider.Reload,
                 beforeSave: timeoutSlider.Commit,
                 afterReset: timeoutSlider.Reload,
@@ -280,26 +405,90 @@ namespace ChestItemFinder
                 max: 100,
                 step: 20
             );
+            // at 0% nothing is drawn: say so right under the slider, so the player does not think the search is broken
+            opacitySlider.Note = value => value <= 0 ? "0%: nothing flashes. The arrows still show the way." : null;
 
             api.AddComplexOption(
                 mod: ModManifest,
                 name: () => "Highlight opacity",
                 draw: opacitySlider.Draw,
-                tooltip: () => "How strong the flashing highlight on chests is. 0% = no highlight is drawn, 100% = fully opaque at the brightest point. Default: 60%.",
+                tooltip: () => "How strong the flashing highlight on chests is. At 0% no highlight is drawn, at 100% it is fully opaque at the brightest point. Default: 60%.",
                 beforeMenuOpened: opacitySlider.Reload,
                 beforeSave: opacitySlider.Commit,
                 afterReset: opacitySlider.Reload,
                 beforeMenuClosed: opacitySlider.CancelDrag,
-                height: () => TickSlider.RowHeight
+                height: () => opacitySlider.Height
             );
 
-            api.AddTextOption(
+            // the three flash colors: a row of color boxes each (one click picks a color, the name shows beside the row)
+            var colorChoices = HighlightColorNames.Select(name => (name, HighlightColors[name])).ToList();
+            string[] colorNames = { "Flash color", "Secondary color 1", "Secondary color 2" };
+            string[] colorTips =
+            {
+                "Flash color of the found chests. When you search for several words (\"fruit, fish\"), the first word uses this color. Default: Yellow.",
+                "Flash color of the second word when you search for several words (\"fruit, fish\"): its chests, and the marks behind it and its items in the result panel. Default: Pink.",
+                "Flash color of the third word when you search for three words (\"fruit, fish, gem\"): its chests, and the marks behind it and its items in the result panel. Default: Sky Blue."
+            };
+            var pickers = new ColorSwatchPicker[3];
+            for (int slot = 0; slot < 3; slot++)
+            {
+                int colorSlot = slot;
+                var picker = pickers[slot] = new ColorSwatchPicker(
+                    readConfig: () => WordColorName(colorSlot),
+                    writeConfig: value =>
+                    {
+                        string name = NormalizeColorName(value, DefaultWordColors[colorSlot]);
+                        if (colorSlot == 0) Config.HighlightColor = name;
+                        else if (colorSlot == 1) Config.SecondaryColor1 = name;
+                        else Config.SecondaryColor2 = name;
+                    },
+                    choices: colorChoices
+                );
+
+                // two words with the same color cannot be told apart: a small note under the row names the other one (only a note, nothing is blocked)
+                picker.SameAsNote = () =>
+                {
+                    for (int other = 0; other < pickers.Length; other++)
+                    {
+                        if (other != colorSlot && pickers[other] != null && string.Equals(pickers[other].Picked, picker.Picked, StringComparison.OrdinalIgnoreCase))
+                            return "Same as " + colorNames[other];
+                    }
+                    return null;
+                };
+
+                api.AddComplexOption(
+                    mod: ModManifest,
+                    name: () => colorNames[colorSlot],
+                    draw: picker.Draw,
+                    tooltip: () => colorTips[colorSlot],
+                    beforeMenuOpened: picker.Reload,
+                    beforeSave: picker.Commit,
+                    afterReset: picker.Reload,
+                    height: () => picker.Height
+                );
+            }
+
+            api.AddSectionTitle(
+                ModManifest,
+                () => "Backpack search",
+                () => "Your backpack is searched just like a chest. If it holds a match, you can make your character flash and show an arrow above your head.");
+
+            // the backpack is searched like a chest (the player flashes, an arrow stands above the player's head, hovering the player lists the
+            // items): the flash and the arrow can each be switched off; the search itself and the hover list stay
+            api.AddBoolOption(
                 mod: ModManifest,
-                getValue: () => Config.HighlightColor,
-                setValue: value => Config.HighlightColor = NormalizeColorName(value),
-                name: () => "Highlight color",
-                tooltip: () => "Color of the flashing highlight on chests. Works together with the opacity setting. Default: Yellow.",
-                allowedValues: HighlightColorNames
+                getValue: () => Config.FlashPlayer,
+                setValue: value => Config.FlashPlayer = value,
+                name: () => "Flash for backpack match",
+                tooltip: () => "When your backpack holds something you searched for, your character flashes like a chest does. Turn this off to stop the flashing. Hovering the mouse over your character still lists the matching items in your backpack while the highlights last. The flash strength is the same as the chests' (Highlight opacity). Default: On."
+            );
+
+            api.AddBoolOption(
+                mod: ModManifest,
+                getValue: () => Config.ShowPlayerArrow,
+                setValue: value => Config.ShowPlayerArrow = value,
+                name: () => "Arrow for backpack match",
+                tooltip: () => "When your backpack holds something you searched for, a red arrow with the word \"Backpack\" stands above your character's head. Turn this off to hide the arrow and its text. The arrows that show the way to chests are not affected. Default: On."
             );
         }
 
@@ -610,6 +799,8 @@ namespace ChestItemFinder
         private static readonly ContainerKind JunimoHutKind = new("junimohut", "Junimo Hut", "Junimo Huts", "Junimo Hut", true, 4);
         private static readonly ContainerKind MillKind = new("mill", "Mill", "Mills", "Mill", true, 5);
         private static readonly ContainerKind DresserKind = new("dresser", "Dresser", "Dressers", "Dresser", true, 6);
+        private static readonly ContainerKind MannequinKind = new("mannequin", "mannequin", "mannequins", "Mannequin", true, 7);
+        private static readonly ContainerKind LostAndFoundKind = new("lostandfound", "Lost and Found box", "Lost and Found boxes", "Lost and Found", true, 8);
 
         /// <summary>The kinds of the storage chests of other mods' buildings, one per building type (named like the building).</summary>
         private readonly Dictionary<string, ContainerKind> buildingKinds = new(StringComparer.OrdinalIgnoreCase);
@@ -634,6 +825,15 @@ namespace ChestItemFinder
 
         /// <summary>Every dresser -> the stand-in Chest that mirrors its items (refreshed whenever the containers are listed or the dresser is opened).</summary>
         private readonly Dictionary<StorageFurniture, Chest> dresserProxies = new(ReferenceEqualityComparer.Instance);
+
+        /// <summary>Every mannequin -> the stand-in Chest that mirrors what it wears (hat, shirt, pants, boots), like a dresser's.</summary>
+        private readonly Dictionary<Mannequin, Chest> mannequinProxies = new(ReferenceEqualityComparer.Instance);
+
+        /// <summary>The stand-in Chest of the Lost and Found box in the Mayor's Manor (team.returnedDonations), null until it is first needed.</summary>
+        private Chest? lostAndFoundProxy;
+
+        /// <summary>The Lost and Found box: the tile the player clicks in the Mayor's Manor (the map's "LostAndFound" action), and the box drawn above it.</summary>
+        private static readonly Vector2 LostAndFoundTile = new(4, 5);
 
         /// <summary>
         /// Every searchable container of the given locations, each once, with its tile (for a building or a dresser: its top left tile) and the
@@ -701,6 +901,23 @@ namespace ChestItemFinder
                         var footprint = new Rectangle(box.X / 64, box.Y / 64, Math.Max(1, (box.Width + 63) / 64), Math.Max(1, (box.Height + 63) / 64));
                         Add(location, new Vector2(footprint.X, footprint.Y), proxy, label, DresserKind, footprint,
                             string.IsNullOrWhiteSpace(dresser.DisplayName) ? "Dresser" : dresser.DisplayName);
+                    }
+
+                    // mannequins (1.6): what they wear (hat, shirt, pants, boots), mirrored into a stand-in Chest like a dresser's. One tile, two tall.
+                    foreach (var pair in location.objects.Pairs)
+                    {
+                        if (pair.Value is not Mannequin mannequin)
+                            continue;
+                        var footprint = new Rectangle((int)pair.Key.X, (int)pair.Key.Y - 1, 1, 2);
+                        Add(location, pair.Key, GetMannequinProxy(mannequin), label, MannequinKind, footprint,
+                            string.IsNullOrWhiteSpace(mannequin.DisplayName) ? "Mannequin" : mannequin.DisplayName);
+                    }
+
+                    // the Lost and Found box in the Mayor's Manor (items left at the fair's grange display and the like): a container while it holds something
+                    if (location.Name == "ManorHouse" && Game1.player?.team.returnedDonations.Any(i => i != null) == true)
+                    {
+                        Vector2 boxTile = LostAndFoundTile;
+                        Add(location, boxTile, GetLostAndFoundProxy(), label, LostAndFoundKind, new Rectangle((int)boxTile.X, (int)boxTile.Y - 1, 1, 2), "Lost and Found");
                     }
                 }
                 catch (Exception ex)
@@ -780,7 +997,7 @@ namespace ChestItemFinder
 
                 if (string.IsNullOrWhiteSpace(name))
                     name = "Building";
-                buildingKinds[type] = kind = new ContainerKind("building:" + type, name, name + "s", name, true, 7);
+                buildingKinds[type] = kind = new ContainerKind("building:" + type, name, name + "s", name, true, 9);
             }
             return kind;
         }
@@ -811,12 +1028,58 @@ namespace ChestItemFinder
             return null;
         }
 
-        /// <summary>The items a container holds right now (a dresser's stand-in is refreshed from the dresser first).</summary>
+        /// <summary>The stand-in Chest of a mannequin, with what it wears copied in (the same item objects, nothing is moved or cloned).</summary>
+        private Chest GetMannequinProxy(Mannequin mannequin)
+        {
+            if (!mannequinProxies.TryGetValue(mannequin, out Chest? proxy))
+                mannequinProxies[mannequin] = proxy = new Chest(false);
+
+            proxy.Items.Clear();
+            foreach (Item? item in new Item?[] { mannequin.hat.Value, mannequin.shirt.Value, mannequin.pants.Value, mannequin.boots.Value })
+            {
+                if (item != null)
+                    proxy.Items.Add(item);
+            }
+            return proxy;
+        }
+
+        /// <summary>The mannequin a stand-in Chest belongs to (null for every other container).</summary>
+        private Mannequin? GetMannequinOf(Chest chest)
+        {
+            foreach (var pair in mannequinProxies)
+            {
+                if (ReferenceEquals(pair.Value, chest))
+                    return pair.Key;
+            }
+            return null;
+        }
+
+        /// <summary>The stand-in Chest of the Lost and Found box, with its items copied in (the same item objects, nothing is moved or cloned).</summary>
+        private Chest GetLostAndFoundProxy()
+        {
+            lostAndFoundProxy ??= new Chest(false);
+            lostAndFoundProxy.Items.Clear();
+            if (Game1.player != null)
+            {
+                foreach (Item? item in Game1.player.team.returnedDonations)
+                {
+                    if (item != null)
+                        lostAndFoundProxy.Items.Add(item);
+                }
+            }
+            return lostAndFoundProxy;
+        }
+
+        /// <summary>The items a container holds right now (the stand-in of a dresser, a mannequin or the Lost and Found box is refreshed first).</summary>
         private IEnumerable<Item> CurrentItems(Chest chest)
         {
             StorageFurniture? dresser = GetDresserOf(chest);
             if (dresser != null)
                 GetDresserProxy(dresser);
+            else if (GetMannequinOf(chest) is Mannequin mannequin)
+                GetMannequinProxy(mannequin);
+            else if (lostAndFoundProxy != null && ReferenceEquals(chest, lostAndFoundProxy))
+                GetLostAndFoundProxy();
             return chest.Items.Where(i => i != null).Select(i => i!);
         }
 
@@ -832,12 +1095,6 @@ namespace ChestItemFinder
         private ContainerKind KindOf(Chest chest)
         {
             return containerInfo.TryGetValue(chest, out ContainerInfo info) ? info.Kind : ChestKind;
-        }
-
-        /// <summary>True for a fridge of any kind (built-in or mini-fridge).</summary>
-        private bool IsFridge(Chest chest)
-        {
-            return KindOf(chest).FamilyKind == FridgeKind;
         }
 
         /// <summary>
@@ -891,20 +1148,7 @@ namespace ChestItemFinder
             return new Vector2(tiles.X + tiles.Width / 2f - 0.5f, tiles.Y + tiles.Height / 2f - 0.5f);
         }
 
-        // The display name of every item in every chest and fridge (same containers as ScanChests looks at).
-        private IEnumerable<string> GetChestItemNames()
-        {
-            foreach (var (_, _, chest, _) in GetAllContainers())
-            {
-                foreach (Item? item in chest.Items)
-                {
-                    if (item != null)
-                        yield return GetShownItemName(item);
-                }
-            }
-        }
-
-        // The display name and stack size of every item in every chest (same chests as GetChestItemNames). The suggestion index adds the stacks up
+        // The display name and stack size of every item in every chest (same containers as ScanChests). The suggestion index adds the stacks up
         // per name, so "Did you mean" and the drop-down know which related item the player holds the most of.
         /// <summary>
         /// One real item of every name the chests hold (suggestion key -> a one-piece copy without star), for the icons of the drop-down: a held item is
@@ -917,10 +1161,8 @@ namespace ChestItemFinder
             var samples = new Dictionary<string, Item>(StringComparer.Ordinal);
             foreach (var (_, _, chest, _) in GetAllContainers())
             {
-                foreach (Item? item in CurrentItems(chest))
+                foreach (Item item in ItemsWithNested(CurrentItems(chest)))
                 {
-                    if (item == null)
-                        continue;
                     string key = SuggestionIndex.MakeKey(GetShownItemName(item));
                     if (key.Length > 0 && !samples.ContainsKey(key))
                         samples[key] = MakeIconSample(item);   // the first one found (two different items of one name, e.g. both Eggs: one of them, as before)
@@ -933,11 +1175,8 @@ namespace ChestItemFinder
         {
             foreach (var (_, _, chest, _) in GetAllContainers())
             {
-                foreach (Item? item in chest.Items)
-                {
-                    if (item != null)
-                        yield return (GetShownItemName(item), Math.Max(1, item.Stack));
-                }
+                foreach (Item item in ItemsWithNested(chest.Items))
+                    yield return (GetShownItemName(item), Math.Max(1, item.Stack));
             }
         }
 
@@ -949,12 +1188,33 @@ namespace ChestItemFinder
         //   - a dresser opens its own clothing menu (a ShopMenu whose source is the dresser).
         private void OnMenuChanged(object? sender, MenuChangedEventArgs e)
         {
-            if (highlightedChests.Count == 0) return;
+            if (!AnyHighlight) return;
+
+            // the backpack is "opened" by opening the inventory page of the game menu, and it ends like a chest does: not locked, every highlight
+            // goes; locked ("Keep highlights" checked), only the backpack's flash goes and the chests stay
+            if (e.NewMenu is GameMenu gameMenu && gameMenu.currentTab == GameMenu.inventoryTab)
+            {
+                if (!highlightBackpack)
+                    return;
+                if (IsKeepHighlightsLocked)
+                {
+                    highlightBackpack = false;
+                    if (highlightedChests.Count == 0)
+                        ClearHighlights();   // that was the last one
+                    return;
+                }
+                ClearHighlights();
+                return;
+            }
 
             Chest? opened = null;
             if (e.NewMenu is ShopMenu shop && shop.source is StorageFurniture dresser)
             {
                 opened = dresserProxies.TryGetValue(dresser, out Chest? proxy) ? proxy : GetDresserProxy(dresser);
+            }
+            else if (e.NewMenu is ShopMenu lostAndFound && lostAndFound.ShopId == "ReturnedDonations" && lostAndFoundProxy != null)
+            {
+                opened = lostAndFoundProxy;   // the Lost and Found box opens as a shop of its items
             }
             else if (e.NewMenu is ItemGrabMenu menu)
             {
@@ -973,7 +1233,7 @@ namespace ChestItemFinder
                 // not a target: a short grey "No target items here" in the lower left corner, if it really holds nothing of the search (a container
                 // that got a matching item after the search is not "empty-handed": then no note). The highlights stay.
                 Func<Item, bool>? matcher = highlightMatcher;
-                bool holdsTarget = matcher != null && CurrentItems(opened).Any(i => matcher(i));
+                bool holdsTarget = matcher != null && ItemsWithNested(CurrentItems(opened)).Any(i => matcher(i));
                 if (!holdsTarget)
                 {
                     ShowLightNote("No target items here");
@@ -993,7 +1253,7 @@ namespace ChestItemFinder
             if (IsKeepHighlightsLocked)
             {
                 highlightedChests.RemoveAll(h => ReferenceEquals(h.chest, opened));
-                if (highlightedChests.Count == 0)
+                if (highlightedChests.Count == 0 && !highlightBackpack)
                     ClearHighlights();   // that was the last one
                 return;
             }
@@ -1065,7 +1325,7 @@ namespace ChestItemFinder
                 var counts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
                 var starCapable = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
                 var order = new List<string>();
-                foreach (Item item in CurrentItems(chest))   // a dresser: its items right now
+                foreach (Item item in ItemsWithNested(CurrentItems(chest)))   // a dresser: its items right now; carried containers inside: theirs too
                 {
                     if (!matcher(item))
                         continue;
@@ -1158,7 +1418,7 @@ namespace ChestItemFinder
         /// <summary>True while the status line is drawn (chests are highlighted, the HUD is up and no menu is open).</summary>
         private bool IsHighlightStatusShown()
         {
-            return highlightedChests.Count > 0 && highlightLabel.Length > 0 && Context.IsWorldReady
+            return AnyHighlight && highlightLabel.Length > 0 && Context.IsWorldReady
                 && Game1.activeClickableMenu == null && !Game1.eventUp && Game1.displayHUD;
         }
 
@@ -1178,7 +1438,10 @@ namespace ChestItemFinder
         private string HighlightStatusText()
         {
             int count = highlightedChests.Count;
-            return $"Highlighting: {highlightLabel} ({count} {ContainerWord(highlightedChests.Select(h => h.chest).ToList())})";
+            string what = count > 0 ? $"{count} {ContainerWord(highlightedChests.Select(h => h.chest).ToList())}" : "";
+            if (highlightBackpack)
+                what = what.Length > 0 ? what + ", backpack" : "backpack";
+            return $"Highlighting: {highlightLabel} ({what})";
         }
 
         /// <summary>Where the notes above the status line end (their bottom edge): just above the status line while it shows, else the corner bottom.</summary>
@@ -1214,7 +1477,25 @@ namespace ChestItemFinder
                 string text = HighlightStatusText();
                 Vector2 size = Game1.smallFont.MeasureString(text);
                 int bottom = CornerBottom((int)Math.Ceiling(size.X));
-                DrawCornerText(b, text, new Vector2(CornerMargin, bottom - size.Y), 1f);
+                var position = new Vector2(CornerMargin, bottom - size.Y);
+                DrawCornerText(b, text, position, 1f);
+
+                // several words: each word once more on top, in its bright color ("Highlighting: 'fruit', 'fish' (12 chests)")
+                string expectedLabel = string.Join(", ", highlightLabelWords);
+                if (highlightLabelWords.Count > 0 && expectedLabel == highlightLabel)
+                {
+                    const string lead = "Highlighting: ";
+                    string before = lead;
+                    for (int w = 0; w < highlightLabelWords.Count; w++)
+                    {
+                        if (w > 0)
+                            before += ", ";
+                        Color wordColor = WordColorName(w) == "Black" ? CornerTextColor : WordFlashColor(w);
+                        var wordPos = new Vector2(MathF.Round(position.X + Game1.smallFont.MeasureString(before).X), MathF.Round(position.Y));
+                        b.DrawString(Game1.smallFont, highlightLabelWords[w], wordPos, wordColor);
+                        before += highlightLabelWords[w];
+                    }
+                }
             }
             catch (Exception ex)
             {
@@ -1339,11 +1620,16 @@ namespace ChestItemFinder
 
         // Avoiding the result panel and the "Keep highlights" box: their screen rectangles of the last frame in which they were drawn are REMEMBERED
         // (until the highlights end or a new search runs), so an arrow that moved out of the panel's way stays in that safe place after the panel has
-        // faded, instead of jumping back to the very edge. The way out of the way is eased in over a few frames (edgeArrowShownShift), so it never jerks.
+        // faded, instead of jumping back to the very edge. The way out of the way is eased in over a few frames (edgeArrowShownShift, one per arrow), so it never jerks.
         private readonly List<Rectangle> edgeArrowObstacles = new();
-        private Vector2 edgeArrowShownShift;   // the shift that is drawn right now (eased towards the wanted one)
-        private int edgeArrowShiftEdge = -1;   // the edge the shift belongs to (0 top / bottom, 1 left / right, 2 above an exit); another edge starts fresh
-        private int edgeArrowShiftTick = int.MinValue;
+        // One slot per arrow that can be on screen at the same time: 0 = the arrow to the nearest chest / exit, 1 = the "Backpack" arrow above the player.
+        private readonly Vector2[] edgeArrowShownShift = new Vector2[2];   // the shift that is drawn right now (eased towards the wanted one)
+        private readonly int[] edgeArrowShiftEdge = { -1, -1 };   // the edge the shift belongs to (0 top / bottom, 1 left / right, 2 above an exit); another edge starts fresh
+        private readonly int[] edgeArrowShiftTick = { int.MinValue, int.MinValue };
+
+        // Where the "Backpack" arrow (with its label) was drawn in the last frame: the chest / exit arrow keeps out of it, so the two never lie on each other.
+        private Rectangle backpackArrowBox;
+        private int backpackArrowTick = int.MinValue;
 
         /// <summary>How much of the remaining way the arrow moves per frame while it gets out of the way (0..1): about a fifth of a second in all.</summary>
         private const float EdgeArrowEase = 0.25f;
@@ -1365,7 +1651,7 @@ namespace ChestItemFinder
         {
             try
             {
-                if (highlightedChests.Count == 0)
+                if (!AnyHighlight)
                 {
                     edgeArrowObstacles.Clear();   // no highlights, no arrow: the next result starts with a clean slate
                     return;
@@ -1383,6 +1669,13 @@ namespace ChestItemFinder
                 GameLocation? here = Game1.currentLocation;
                 Farmer? player = Game1.player;
                 if (here == null || player == null)
+                    return;
+
+                // the backpack is a place like a chest: whenever it holds something of the search (also while chests are highlighted), an arrow stands
+                // above the player's head and says "Backpack". It is drawn first; the arrow to the nearest chest below keeps out of it.
+                if (highlightBackpack && Config.ShowPlayerArrow)
+                    DrawArrowAboveWorldPoint(e.SpriteBatch, new Vector2(player.Position.X + 32f, player.Position.Y - 40f), BackpackPlaceKey, 1);
+                if (highlightedChests.Count == 0)
                     return;
 
                 var view = new Rectangle(Game1.viewport.X, Game1.viewport.Y, Game1.viewport.Width, Game1.viewport.Height);   // world pixels on screen
@@ -1672,11 +1965,16 @@ namespace ChestItemFinder
         /// <summary>The arrow standing right above an on-screen tile (an exit of the current location), pointing down at it.</summary>
         private void DrawArrowAboveTile(SpriteBatch b, Point tile, string label)
         {
-            Vector2 world = new Vector2(tile.X * 64f + 32f, tile.Y * 64f - 40f);
+            DrawArrowAboveWorldPoint(b, new Vector2(tile.X * 64f + 32f, tile.Y * 64f - 40f), label, 0);
+        }
+
+        /// <summary>The arrow standing right above a point of the world (pixels), pointing down at it. slot: see edgeArrowShownShift.</summary>
+        private void DrawArrowAboveWorldPoint(SpriteBatch b, Vector2 world, string label, int slot)
+        {
             Vector2 spot = Utility.ModifyCoordinatesForUIScale(Game1.GlobalToLocal(Game1.viewport, world));
             spot.X = Math.Clamp(spot.X, EdgeArrowMargin, Game1.uiViewport.Width - EdgeArrowMargin);
             spot.Y = Math.Clamp(spot.Y, EdgeArrowMargin + EdgeArrowLabelGap, Game1.uiViewport.Height - EdgeArrowMargin);
-            DrawEdgeArrow(b, spot, MathHelper.PiOver2, label, new Vector2(0f, -1f));
+            DrawEdgeArrow(b, spot, MathHelper.PiOver2, label, new Vector2(0f, -1f), slot);
         }
 
         /// <summary>Free space between the arrow and its label, and around the player and the toolbar (UI pixels).</summary>
@@ -1693,7 +1991,7 @@ namespace ChestItemFinder
         ///     left / right) until they are clear of the player's sprite; an arrow above an exit moves up above the player instead.
         /// The arrow keeps its direction; only its place moves a little.
         /// </summary>
-        private void DrawEdgeArrow(SpriteBatch b, Vector2 spot, float angle, string label, Vector2 labelSide)
+        private void DrawEdgeArrow(SpriteBatch b, Vector2 spot, float angle, string label, Vector2 labelSide, int slot = 0)
         {
             Texture2D arrow = GetEdgeArrowTexture(b.GraphicsDevice);
             SpriteFont font = Game1.smallFont;
@@ -1796,13 +2094,16 @@ namespace ChestItemFinder
 
             // never on the result panel, its X or the "Keep highlights" box (also after they have faded: see edgeArrowObstacles). The group moves the
             // shortest way out (usually down, below the panel), and stays clear of the player and the toolbar while doing so.
-            if (edgeArrowObstacles.Count > 0)
+            List<Rectangle> arrowObstacles = edgeArrowObstacles;
+            if (slot == 0 && backpackArrowTick == Game1.ticks)
+                arrowObstacles = new List<Rectangle>(edgeArrowObstacles) { backpackArrowBox };   // the "Backpack" arrow above the player
+            if (arrowObstacles.Count > 0)
             {
                 for (int round = 0; round < 4; round++)
                 {
                     Rectangle box = GroupBox(position);
                     Rectangle? hit = null;
-                    foreach (Rectangle obstacle in edgeArrowObstacles)
+                    foreach (Rectangle obstacle in arrowObstacles)
                     {
                         Rectangle grown = obstacle;
                         grown.Inflate(EdgeArrowSpacing, EdgeArrowSpacing);
@@ -1850,13 +2151,19 @@ namespace ChestItemFinder
             Vector2 plain = KeepInside(spot);
             Vector2 wantedShift = position - plain;
             int edgeKind = aboveExit ? 2 : sideEdge ? 1 : 0;
-            if (edgeKind != edgeArrowShiftEdge || Game1.ticks - edgeArrowShiftTick > 2)
-                edgeArrowShownShift = wantedShift;   // another edge, or the arrow was not drawn a moment ago: start at the wanted place
+            if (edgeKind != edgeArrowShiftEdge[slot] || Game1.ticks - edgeArrowShiftTick[slot] > 2)
+                edgeArrowShownShift[slot] = wantedShift;   // another edge, or the arrow was not drawn a moment ago: start at the wanted place
             else
-                edgeArrowShownShift += (wantedShift - edgeArrowShownShift) * EdgeArrowEase;
-            edgeArrowShiftEdge = edgeKind;
-            edgeArrowShiftTick = Game1.ticks;
-            position = plain + edgeArrowShownShift;
+                edgeArrowShownShift[slot] += (wantedShift - edgeArrowShownShift[slot]) * EdgeArrowEase;
+            edgeArrowShiftEdge[slot] = edgeKind;
+            edgeArrowShiftTick[slot] = Game1.ticks;
+            position = plain + edgeArrowShownShift[slot];
+
+            if (slot == 1)
+            {
+                backpackArrowBox = GroupBox(position);   // the chest / exit arrow keeps out of this box
+                backpackArrowTick = Game1.ticks;
+            }
 
             // the item list of a hovered place (the mouse is on a place word of the panel) lies where arrow or label would be: both stay away while
             // the list is up. The list changes size with every place and comes and goes as the mouse moves, so moving the arrow around it would only
@@ -1968,6 +2275,7 @@ namespace ChestItemFinder
         private void ClearHighlights()
         {
             highlightedChests.Clear();
+            highlightBackpack = false;   // backpackWordSlots stay, like chestWordSlots: a revived "Keep highlights" box brings the flash back in its colors
             highlightUntilMs = -1;
         }
 
@@ -1986,12 +2294,264 @@ namespace ChestItemFinder
                 Game1.playSound(cue);
             }
 
+            // the highlighted containers may have been moved, destroyed or picked up since the search (see TARGET MOVED OR GONE)
+            if (Context.IsWorldReady && e.IsMultipleOf(ContainerCheckTicks) && (highlightedChests.Count > 0 || keepSavedChests is { Count: > 0 }))
+                CheckHighlightedContainers();
+
             bool hoverFreezesHighlights = nowMs - highlightHoverFrameMs <= HighlightHoverFreshMs;   // the mouse is on the result panel right now
-            if (!IsKeepHighlightsLocked && !hoverFreezesHighlights && highlightedChests.Count > 0 && highlightUntilMs >= 0 && nowMs >= highlightUntilMs)
+            if (!IsKeepHighlightsLocked && !hoverFreezesHighlights && AnyHighlight && highlightUntilMs >= 0 && nowMs >= highlightUntilMs)
             {
                 ClearHighlights();
                 Monitor.Log("Chest highlights expired.", LogLevel.Debug);
             }
+        }
+
+        // ===================== TARGET MOVED OR GONE =====================
+        // A highlight belongs to the CONTAINER, not to the tile it stood on at the time of the search. A few times a second every highlighted
+        // container is looked up again where it lives (CheckHighlightedContainers):
+        //   moved     a chest kicked by a villager, a chest or mini-fridge pushed one tile with a tool, a Mill / Junimo Hut moved by Robin, a dresser
+        //             moved: the highlight follows it (flash, hover tip, "was it opened", the arrow), with a light note in the lower left corner;
+        //   gone      destroyed, demolished by Robin, or its building demolished (a barn, a cabin: every container inside goes with it): its highlight
+        //             ends at once, with a light note; when nothing is left, every highlight ends (the arrow, the status line). A placed chest a
+        //             villager bumps into is shoved onto a free tile nearby (Chest.TryMoveToSafePosition: land only, never water, up to three tiles
+        //             through passable ground); when there is none, next to water for example, the game destroys it and drops what it held on the
+        //             ground there (GameLocation.checkDestroyItem -> Chest.destroyAndDropContents), where items can roll into the water and sink.
+        //             That counts as destroyed: the note says the items were dropped nearby, so the player goes and picks them up;
+        //   picked up into the backpack or into a chest (a dresser keeps its clothes): its old place ends ("picked up"); in the backpack, when what it
+        //             holds belongs to the search, the backpack flashes instead (see CONTAINERS INSIDE CONTAINERS).
+        // A note is shown at most once every ContainerNoteRepeatMs for the same container, and only one at a time (the newest wins). The result panel
+        // is NOT updated: it is the picture of the moment of the search and fades away on its own. The chests saved for a "Keep highlights" box
+        // that is fading out are kept up to date the same way (without notes), so checking the box again never brings back a stale place.
+        // Moves made by other mods (a chest carried to another location ...) are left to the mod compatibility version: such a chest counts as gone.
+
+        private const int ContainerCheckTicks = 15;              // about four times a second
+        private const long ContainerNoteRepeatMs = 5000;
+        private readonly Dictionary<Chest, long> containerNoteMs = new(ReferenceEqualityComparer.Instance);
+
+        private enum ContainerFate { Same, Moved, Gone, Destroyed, PickedUp, IntoBackpack }
+
+        private void CheckHighlightedContainers()
+        {
+            try
+            {
+                var live = new HashSet<GameLocation>(GetAllLocations().Select(l => l.location), ReferenceEqualityComparer.Instance);
+                var moved = new List<(Chest Chest, string Name)>();
+                var ended = new List<(Chest Chest, string Name, ContainerFate Fate)>();
+                bool changed = false;
+
+                for (int i = highlightedChests.Count - 1; i >= 0; i--)
+                {
+                    var (location, position, chest) = highlightedChests[i];
+                    string name = InfoOf(chest, position).FullName;   // before it is updated
+                    ContainerFate fate = LocateContainer(location, position, chest, live, out Vector2 now);
+                    switch (fate)
+                    {
+                        case ContainerFate.Same:
+                            continue;
+                        case ContainerFate.Moved:
+                            highlightedChests[i] = (location, now, chest);
+                            moved.Add((chest, name));
+                            break;
+                        default:
+                            highlightedChests.RemoveAt(i);
+                            ended.Add((chest, name, fate));
+                            break;
+                    }
+                    changed = true;
+                }
+
+                // the chests of a "Keep highlights" box that is fading out: the same, without notes
+                if (keepSavedChests != null)
+                {
+                    for (int i = keepSavedChests.Count - 1; i >= 0; i--)
+                    {
+                        var (location, position, chest) = keepSavedChests[i];
+                        ContainerFate fate = LocateContainer(location, position, chest, live, out Vector2 now);
+                        if (fate == ContainerFate.Moved)
+                            keepSavedChests[i] = (location, now, chest);
+                        else if (fate != ContainerFate.Same)
+                            keepSavedChests.RemoveAt(i);
+                    }
+                }
+
+                if (!changed)
+                    return;
+
+                // a container that went into the backpack and holds something of the search: the backpack is highlighted now (in that container's colors)
+                bool toBackpack = false;
+                foreach (var (chest, _, fate) in ended)
+                {
+                    if (fate != ContainerFate.IntoBackpack || highlightMatcher is not Func<Item, bool> matcher)
+                        continue;
+                    if (!ItemsWithNested(GetBackpackItems()).Any(i => matcher(i)))
+                        continue;
+                    highlightBackpack = true;
+                    toBackpack = true;
+                    if (chestWordSlots.TryGetValue(chest, out int[]? slots))
+                        backpackWordSlots = StripOrder(backpackWordSlots.Concat(slots));
+                }
+
+                edgeRouteFrom = null;           // the arrow works out its target again at once
+                exitGraph = null;               // a building may have moved or gone: the ways between the locations are read again
+
+                if (!AnyHighlight)
+                    ClearHighlights();          // that was the last one: the arrow and the status line go too
+
+                ShowContainerNote(moved, ended, toBackpack);
+            }
+            catch (Exception ex)
+            {
+                Monitor.LogOnce($"Could not check the highlighted containers: {ex.Message}", LogLevel.Trace);   // the highlights simply stay as they are
+            }
+        }
+
+        /// <summary>One light note for what happened in one check (see TARGET MOVED OR GONE); nothing when every container concerned had a note a moment ago.</summary>
+        private void ShowContainerNote(List<(Chest Chest, string Name)> moved, List<(Chest Chest, string Name, ContainerFate Fate)> ended, bool toBackpack)
+        {
+            long now = clock.ElapsedMilliseconds;
+            bool Fresh(Chest chest)
+            {
+                if (containerNoteMs.TryGetValue(chest, out long last) && now - last < ContainerNoteRepeatMs)
+                    return false;
+                containerNoteMs[chest] = now;
+                return true;
+            }
+
+            var newEnded = ended.Where(x => Fresh(x.Chest)).ToList();
+            var newMoved = moved.Where(x => Fresh(x.Chest)).ToList();
+
+            string? note = null;
+            if (newEnded.Count > 1)
+            {
+                string what = ContainerWord(newEnded.Select(x => x.Chest).ToList());
+                note = $"{newEnded.Count} {what} are gone: their highlights ended.";
+            }
+            else if (newEnded.Count == 1)
+            {
+                var (_, name, fate) = newEnded[0];
+                note = fate switch
+                {
+                    ContainerFate.IntoBackpack when toBackpack => $"{name} is in your backpack now: your backpack is highlighted.",
+                    ContainerFate.IntoBackpack or ContainerFate.PickedUp => $"{name} was picked up: its highlight ended.",
+                    ContainerFate.Destroyed => $"{name} was destroyed: its items were dropped nearby.",
+                    _ => $"{name} is gone: its highlight ended."
+                };
+            }
+            else if (newMoved.Count > 0)
+            {
+                note = newMoved.Count == 1
+                    ? $"{newMoved[0].Name} was moved: its highlight follows it."
+                    : $"{newMoved.Count} {ContainerWord(newMoved.Select(x => x.Chest).ToList())} were moved: their highlights follow them.";
+            }
+
+            if (note != null)
+                ShowLightNote(note);
+        }
+
+        /// <summary>
+        /// Where a highlighted container is now (see TARGET MOVED OR GONE). Moved: <paramref name="newPosition"/> is its new tile and its footprint is
+        /// updated. Only the container's own location is searched (vanilla moves never leave it); a container it cannot find there is gone, unless it is
+        /// in the backpack or (one level) in a chest.
+        /// </summary>
+        private ContainerFate LocateContainer(GameLocation location, Vector2 position, Chest chest, HashSet<GameLocation> live, out Vector2 newPosition)
+        {
+            newPosition = position;
+            if (!live.Contains(location))
+                return ContainerFate.Gone;   // its building was demolished: everything inside went with it
+
+            ContainerInfo info = InfoOf(chest, position);
+            ContainerFate Follow(Rectangle footprint, out Vector2 to)
+            {
+                containerInfo[chest] = new ContainerInfo(info.Kind, footprint, info.FullName);
+                to = new Vector2(footprint.X, footprint.Y);
+                return to == position && footprint == info.Footprint ? ContainerFate.Same : ContainerFate.Moved;
+            }
+
+            // a dresser (its stand-in chest)
+            StorageFurniture? dresser = GetDresserOf(chest);
+            if (dresser != null)
+            {
+                if (location.furniture.Contains(dresser))
+                {
+                    Rectangle box = dresser.GetBoundingBox();
+                    return Follow(new Rectangle(box.X / 64, box.Y / 64, Math.Max(1, (box.Width + 63) / 64), Math.Max(1, (box.Height + 63) / 64)), out newPosition);
+                }
+                return WhereDidItGo(dresser);
+            }
+
+            // a mannequin (its stand-in chest): it can be picked up and put somewhere else like a chest
+            Mannequin? mannequin = GetMannequinOf(chest);
+            if (mannequin != null)
+            {
+                foreach (var pair in location.objects.Pairs)
+                {
+                    if (ReferenceEquals(pair.Value, mannequin))
+                        return Follow(new Rectangle((int)pair.Key.X, (int)pair.Key.Y - 1, 1, 2), out newPosition);
+                }
+                return WhereDidItGo(mannequin);
+            }
+
+            // the Lost and Found box never moves (taking everything out of it only leaves it empty)
+            if (info.Kind == LostAndFoundKind)
+                return ContainerFate.Same;
+
+            // the built-in fridge of a house: it never moves; it only goes with its house
+            if (info.Kind == FridgeKind)
+                return ReferenceEquals(location.GetFridge(), chest) ? ContainerFate.Same : ContainerFate.Gone;
+
+            // the storage of a building (Mill, Junimo Hut ...): follows its building
+            if (info.Kind == MillKind || info.Kind == JunimoHutKind || info.Kind.Key.StartsWith("building:", StringComparison.Ordinal))
+            {
+                foreach (Building building in location.buildings)
+                {
+                    if (GetBuildingStorage(building).Any(c => ReferenceEquals(c, chest)))
+                        return Follow(new Rectangle(building.tileX.Value, building.tileY.Value, Math.Max(1, building.tilesWide.Value), Math.Max(1, building.tilesHigh.Value)), out newPosition);
+                }
+                return ContainerFate.Gone;
+            }
+
+            // an Auto-Grabber (its storage is the chest it holds)
+            if (info.Kind == AutoGrabberKind)
+            {
+                if (location.objects.TryGetValue(position, out StardewValley.Object? here) && ReferenceEquals(here.heldObject.Value, chest))
+                    return ContainerFate.Same;
+                foreach (var pair in location.objects.Pairs)
+                {
+                    if (ReferenceEquals(pair.Value.heldObject.Value, chest))
+                        return Follow(new Rectangle((int)pair.Key.X, (int)pair.Key.Y, 1, 1), out newPosition);
+                }
+                StardewValley.Object? grabber = Game1.player?.Items.OfType<StardewValley.Object>().FirstOrDefault(o => ReferenceEquals(o.heldObject.Value, chest));
+                return grabber != null ? ContainerFate.PickedUp : ContainerFate.Gone;
+            }
+
+            // a placed chest of any size, a mini-fridge
+            if (location.objects.TryGetValue(position, out StardewValley.Object? atTile) && ReferenceEquals(atTile, chest))
+                return ContainerFate.Same;
+            foreach (var pair in location.objects.Pairs)
+            {
+                if (ReferenceEquals(pair.Value, chest))
+                    return Follow(new Rectangle((int)pair.Key.X, (int)pair.Key.Y, 1, 1), out newPosition);
+            }
+            ContainerFate fate = WhereDidItGo(chest);
+
+            // shoved by a villager with no free tile around it (next to water ...): the game destroyed it and dropped its items where it stood
+            if (fate == ContainerFate.Gone && location.debris.Any(d => d.item != null && d.Chunks.Count > 0 && Vector2.Distance(d.Chunks[0].position.Value / 64f, position) <= 4f))
+                return ContainerFate.Destroyed;
+            return fate;
+        }
+
+        /// <summary>A container that left its place: in the backpack, in a chest (one level), or gone.</summary>
+        private ContainerFate WhereDidItGo(Item container)
+        {
+            if (Game1.player != null && Game1.player.Items.Any(i => ReferenceEquals(i, container)))
+                return ContainerFate.IntoBackpack;
+
+            foreach (var (_, _, chest, _) in GetAllContainers())
+            {
+                if (chest.Items.Any(i => ReferenceEquals(i, container)))
+                    return ContainerFate.PickedUp;
+            }
+            return ContainerFate.Gone;
         }
 
         private void OnAudit(string command, string[] args)
@@ -2011,16 +2571,200 @@ namespace ChestItemFinder
             }
         }
 
+        // ===================== CONSOLE SEARCH (find_item) =====================
+        // The SMAPI console command. It is the search box without the box: the same checks (SearchMenu.CheckQuery, and a product the game never
+        // makes), the same search (ScanChests), so the panel, the highlights and the arrows in the game are exactly the same. On top of that it
+        // writes a plain text list to the console that can be read and copied: the panel's title, then one line per container, nearest first
+        // (walking distance), with its place, its name, its tile and the matching items (count, and the stars of items that can have them).
+        // Mostly used by players looking for a lost item. Read only: nothing is created, moved or changed, and nothing is added to the search
+        // history (that belongs to the search box). A quality is typed into the text like in the box: "gold star apple".
+        private const string FindItemUsage = "Usage: find_item <search>, e.g. find_item starfruit / find_item fruit, fish / find_item gold star apple";
+
+        /// <summary>True while find_item runs its search: ScanChests then leaves the console to it (no short one-line log of its own).</summary>
+        private bool consoleSearchRunning;
+
         private void OnFindItem(string command, string[] args)
         {
-            if (args.Length == 0)
+            if (!Context.IsWorldReady)
             {
-                Monitor.Log("Usage: find_item <item name>", LogLevel.Info);
+                Monitor.Log("Load a save first. " + FindItemUsage, LogLevel.Info);
                 return;
             }
 
-            ScanChests(string.Join(" ", args));
+            string text = string.Join(" ", args).Trim();
+            if (text.Length == 0)
+            {
+                Monitor.Log(FindItemUsage, LogLevel.Info);
+                return;
+            }
+
+            try
+            {
+                CreateSuggestionProvider();   // the word lists the search needs (aliases, spellings, "Did you mean"), made ready as when the box opens
+
+                // the same refusals as Enter in the search box, with the same red hint text
+                string? refusal = SearchMenu.CheckQuery(text, out string query, out int? qualityInText);
+                if (refusal != null)
+                {
+                    Monitor.Log(refusal, LogLevel.Info);
+                    return;
+                }
+
+                // a product the game never makes ("corn jelly"): the box's two lines, nothing is searched
+                string plainQuery = NormalizeQueryText(query);
+                if (!HasCommas(query) && GetImpossibleProduct(plainQuery) is SuggestionIndex.ImpossibleProduct impossible)
+                {
+                    Monitor.Log($"There's no {impossible.Missing}. {impossible.Subject}{impossible.Middle}{impossible.Link}{impossible.Tail}", LogLevel.Info);
+                    var others = impossible.Alternatives.Select(StripCategorySuffix).ToList();
+                    if (impossible.Split != null)
+                        others.Add(impossible.Split);
+                    if (others.Count > 0)
+                        Monitor.Log(DidYouMeanLabel + string.Join(", ", others), LogLevel.Info);
+                    return;
+                }
+
+                SearchReport report;
+                consoleSearchRunning = true;
+                try
+                {
+                    report = ScanChests(query, qualityInText ?? AnyQuality);
+                }
+                finally
+                {
+                    consoleSearchRunning = false;
+                }
+
+                if (report.Outcome == SearchOutcome.NoMatchingQuality)
+                {
+                    Monitor.Log("Item found, but no matching quality. Try another quality.", LogLevel.Info);
+                    return;
+                }
+
+                foreach (string line in BuildConsoleResult())
+                    Monitor.Log(line, LogLevel.Info);
+            }
+            catch (Exception ex)
+            {
+                Monitor.Log($"The search failed: {ex.Message}", LogLevel.Error);
+                Monitor.Log(ex.ToString(), LogLevel.Trace);
+            }
         }
+
+        /// <summary>
+        /// The console text of the search that just ran: the panel's title; then, when something was found, one numbered line per container,
+        /// nearest first ("1. Backpack: Apple x2", "2. Farm, Chest at tile (64, 15): Apple x12 (gold 3, no star 9)"); when nothing was found, the
+        /// panel's "Did you mean" words. A fourth word that was not searched gets the panel's note at the end.
+        /// </summary>
+        private List<string> BuildConsoleResult()
+        {
+            var lines = new List<string> { notifyTitle };
+
+            if (resultFailed)
+            {
+                if (resultSuggestions.Count > 0)
+                    lines.Add(resultHintLead + string.Join(", ", resultSuggestions.Select(s => s.Label)));
+            }
+            else
+            {
+                Func<Item, bool> matches = highlightMatcher ?? (_ => false);
+                var rows = new List<(float Distance, string Text)>();
+
+                if (highlightBackpack)
+                    rows.Add((-1f, "Backpack: " + DescribeConsoleItems(GetBackpackItems(), matches)));
+
+                // walking distances from where the player stands now (the same order as the place list of the panel)
+                GameLocation? here = Game1.currentLocation;
+                Vector2 playerTile = Game1.player?.Tile ?? Vector2.Zero;
+                int playerWeight = GetMapWeight(here);
+                Dictionary<GameLocation, (float Cost, Vector2? Arrival, Point FirstExit)>? reach = null;
+                try
+                {
+                    if (here != null)
+                        reach = ComputeReach(GetExitGraph(), here, playerTile);
+                }
+                catch (Exception ex)
+                {
+                    Monitor.Log($"Could not work out the walking distances: {ex.Message}", LogLevel.Trace);   // the rough map order is used
+                }
+
+                var placeLabels = new Dictionary<GameLocation, string>(ReferenceEqualityComparer.Instance);
+                foreach (var (location, label) in GetAllLocations())
+                    placeLabels[location] = label;
+
+                foreach (var (location, position, chest) in highlightedChests)
+                {
+                    string? islandArea = GetIslandArea(location.Name);
+                    string place = islandArea != null ? $"Ginger Island ({islandArea})"
+                        : placeLabels.TryGetValue(location, out string? label) ? label
+                        : GetFriendlyName(location.Name);
+                    string name = InfoOf(chest, position).FullName;
+                    float distance = GetPlaceSortKey(location, position, here, playerTile, playerWeight, reach);
+                    rows.Add((distance, $"{place}, {name} at tile ({(int)position.X}, {(int)position.Y}): {DescribeConsoleItems(CurrentItems(chest), matches)}"));
+                }
+
+                int number = 1;
+                foreach (var row in rows.OrderBy(r => r.Distance))   // a stable sort: the same distance keeps the order the containers were found in
+                    lines.Add($"  {number++}. {row.Text}");
+            }
+
+            if (lastIgnoredTerms.Count > 0)
+            {
+                lines.Add($"Only {MaxSearchTerms} at a time: {string.Join(", ", lastIgnoredTerms.Select(t => "\"" + t + "\""))} "
+                    + (lastIgnoredTerms.Count == 1 ? "was" : "were") + " not searched.");
+            }
+            if (lostOnDeathNote.Length > 0)
+                lines.Add(lostOnDeathNote);
+
+            return lines;
+        }
+
+        /// <summary>
+        /// The matching items of one container for the console: "Apple x12 (gold 3, no star 9), Starfruit x5". An item inside a carried container
+        /// gets its name in front ("Birch Dresser > Shirt x5"); the stars are only written for an item that can have them and has at least one.
+        /// </summary>
+        private static string DescribeConsoleItems(IEnumerable<Item?> items, Func<Item, bool> matches)
+        {
+            var names = new List<string>();
+            var byQuality = new Dictionary<string, SortedDictionary<int, int>>();
+            var canHaveStars = new HashSet<string>();
+
+            foreach (var (item, inside, _) in WithNested(items))
+            {
+                if (!matches(item))
+                    continue;
+                string name = GetShownItemName(item);
+                if (string.IsNullOrWhiteSpace(name))
+                    name = item.DisplayName;
+                if (inside != null)
+                    name = inside + " > " + name;
+
+                if (!byQuality.TryGetValue(name, out SortedDictionary<int, int>? counts))
+                {
+                    byQuality[name] = counts = new SortedDictionary<int, int>(Comparer<int>.Create((a, b) => b.CompareTo(a)));   // best star first
+                    names.Add(name);
+                }
+                counts[item.Quality] = counts.GetValueOrDefault(item.Quality) + item.Stack;
+                if (CanHaveQuality(item))
+                    canHaveStars.Add(name);
+            }
+
+            return string.Join(", ", names.Select(name =>
+            {
+                SortedDictionary<int, int> counts = byQuality[name];
+                string text = $"{name} x{counts.Values.Sum()}";
+                if (canHaveStars.Contains(name) && counts.Keys.Any(q => q > 0))
+                    text += " (" + string.Join(", ", counts.Select(pair => $"{ConsoleStarName(pair.Key)} {pair.Value}")) + ")";
+                return text;
+            }));
+        }
+
+        private static string ConsoleStarName(int quality) => quality switch
+        {
+            1 => "silver",
+            2 => "gold",
+            4 => "iridium",
+            _ => "no star"
+        };
 
         // Game1.locations only holds top-level locations; building interiors
         // (sheds, barns, coops, cabins) live inside each building, so walk those too.
@@ -3044,12 +3788,6 @@ namespace ChestItemFinder
             return HasCommas(text) ? string.Join(", ", GetCommaTerms(text)) : StripCategorySuffix(text);
         }
 
-        /// <summary>The words a search really takes: ResolveAllTerms, at most MaxSearchTerms of them (see AT MOST THREE AT A TIME).</summary>
-        private List<string> ResolveTerms(List<Item> allItems, string queryText)
-        {
-            return ResolveAllTerms(allItems, queryText).Take(MaxSearchTerms).ToList();
-        }
-
         /// <summary>
         /// The separate words of a normalized query: split at the commas if there are any, otherwise at the spaces (see SplitBySpaces). A word
         /// that means the same as an earlier one ("egg fruit egg", "fruit fruits", "trash junk") is left out: only its first place counts.
@@ -3121,11 +3859,30 @@ namespace ChestItemFinder
         /// <summary>How many words (categories or items) one search takes.</summary>
         internal const int MaxSearchTerms = 3;
 
-        /// <summary>The same limit, by the name the search box uses for its several-category drop-down.</summary>
-        internal const int MaxCategoryTerms = MaxSearchTerms;
-
         /// <summary>The words of the last search that were left out (the fourth one on), for the last line of the result panel. Empty = none.</summary>
         private List<string> lastIgnoredTerms = new();
+
+        // ===================== LOST WHEN THE PLAYER DIED (Marlon) =====================
+        // Items lost in the mines on the last death can be bought back from Marlon at the Adventurer's Guild (Farmer.itemsLostLastDeath). They lie in
+        // no container, so they are not a place: when the search matches some of them, the panel (and the console) end with one grey line saying so.
+        private string lostOnDeathNote = "";
+
+        /// <summary>The note line for the items of the last death the search matches, or "" (see LOST WHEN THE PLAYER DIED).</summary>
+        private static string BuildLostOnDeathNote(Func<Item, bool> matches)
+        {
+            Farmer? player = Game1.player;
+            if (player == null)
+                return "";
+            List<string> names = player.itemsLostLastDeath
+                .Where(i => i != null && matches(i))
+                .Select(i => string.IsNullOrWhiteSpace(GetShownItemName(i)) ? i.DisplayName : GetShownItemName(i))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            if (names.Count == 0)
+                return "";
+            string list = string.Join(", ", names.Take(3)) + (names.Count > 3 ? ", ..." : "");
+            return $"Lost when you died: {list}. Buy {(names.Count == 1 ? "it" : "them")} back from Marlon at the Adventurer's Guild.";
+        }
 
         /// <summary>
         /// The words of a text that a search would leave out (the fourth one on), in the order typed, split exactly like the search splits it
@@ -3191,7 +3948,7 @@ namespace ChestItemFinder
         /// <summary>
         /// The words of a text as the category check sees them: at the commas if there are any, otherwise at the spaces, where a run of words that is
         /// ONE category word stays together ("artisan goods fish" -> artisan goods | fish). Used by the search box (the drop-down for several
-        /// categories, the note about a fourth one); the search itself splits with the item names too (ResolveTerms).
+        /// categories, the note about a fourth one); the search itself splits with the item names too (ResolveAllTerms).
         /// </summary>
         internal static List<string> SplitKeepingCategories(string text)
         {
@@ -3804,11 +4561,127 @@ namespace ChestItemFinder
             return singleItemQualityRows ? name + QualityRowSeparator + item.Quality.ToString(CultureInfo.InvariantCulture) : name;
         }
 
-        /// <summary>The item name of a row key ("Apple Wine" of "Apple Wine" + quality).</summary>
+        /// <summary>The item name of a row key ("Apple Wine" of "Apple Wine" + quality, also of a row inside a carried container).</summary>
         private static string RowName(string key)
         {
+            int nest = key.IndexOf(NestedRowSeparator);
+            if (nest >= 0)
+                key = key.Substring(nest + 1);
             int cut = key.IndexOf(QualityRowSeparator);
             return cut < 0 ? key : key.Substring(0, cut);
+        }
+
+        // ===================== CONTAINERS INSIDE CONTAINERS (one level) =====================
+        // A container can itself lie in the backpack or in a chest: a picked-up dresser keeps its clothes, a mini-fridge or chest item may hold things.
+        // What such a container holds is searched too, as part of the backpack / the chest it lies in, ONE level deep only (a chest in a chest in the
+        // backpack is not opened). Its rows in the item lists are marked with the container's name: "Mini-Fridge > Apple x3" under "Backpack total",
+        // so they are never mixed up with the items lying there directly. A Junimo Chest item is not opened (its items are the shared Junimo
+        // inventory, already found through every placed Junimo Chest), nor is a fish tank (its fish are no storage).
+        private const char NestedRowSeparator = '\u001E';
+
+        /// <summary>The items, each with the name of the carried container it lies in (null = directly there), one level deep.</summary>
+        private static IEnumerable<(Item Item, string? Inside, Item? Container)> WithNested(IEnumerable<Item?>? items)
+        {
+            if (items == null)
+                yield break;
+            foreach (Item? item in items)
+            {
+                if (item == null)
+                    continue;
+
+                // what the player wears (see WORN ITEMS): only its items count, the stand-in itself is no item of the backpack
+                bool worn = IsEquippedProxy(item);
+                if (!worn)
+                    yield return (item, null, null);
+
+                IEnumerable<Item?>? inner = null;
+                if (worn)
+                    inner = ((Chest)item).Items;
+                else if (item is Chest carried && carried.SpecialChestType != Chest.SpecialChestTypes.JunimoChest)
+                    inner = carried.Items;
+                else if (item is StorageFurniture furniture && item is not FishTankFurniture)
+                    inner = furniture.heldItems;
+                if (inner == null)
+                    continue;
+
+                string inside = worn ? EquippedLabel : string.IsNullOrWhiteSpace(item.DisplayName) ? "Container" : item.DisplayName;
+                foreach (Item? innerItem in inner)
+                {
+                    if (innerItem != null)
+                        yield return (innerItem, inside, item);
+                }
+            }
+        }
+
+        /// <summary>The items and, one level deep, the items of the containers among them (see CONTAINERS INSIDE CONTAINERS).</summary>
+        private static IEnumerable<Item> ItemsWithNested(IEnumerable<Item?>? items)
+        {
+            return WithNested(items).Select(pair => pair.Item);
+        }
+
+        // per place key: whether something of the search lies there directly, and the carried containers the rest lies in (see PlaceNestNote)
+        private readonly Dictionary<string, (bool Direct, List<Item> Containers)> placeNesting = new();
+
+        /// <summary>
+        /// The "in ..." part of a place's bracket note: written only when EVERYTHING the search found at that place lies inside carried containers
+        /// (a dresser full of clothes in the backpack, in a chest, in a fridge ...), so the player knows to look inside them: "Backpack (in Birch
+        /// Dresser)", "Farmhouse (fridge, in Birch Dresser)". Several containers: "in 2 dressers" / "in 2 chests" / "in 3 containers". Empty when
+        /// something lies there directly (the hover list marks the rest with the container's name anyway).
+        /// </summary>
+        private string PlaceNestNote(string key)
+        {
+            if (!placeNesting.TryGetValue(key, out var nesting) || nesting.Direct || nesting.Containers.Count == 0)
+                return "";
+
+            // what the player wears is no container: "Backpack (equipped)", or with carried containers too "Backpack (equipped, in Birch Dresser)"
+            bool equipped = nesting.Containers.Any(IsEquippedProxy);
+            List<Item> containers = nesting.Containers.Where(c => !IsEquippedProxy(c)).ToList();
+            string carried;
+            if (containers.Count == 0)
+                carried = "";
+            else if (containers.Count == 1)
+                carried = "in " + (string.IsNullOrWhiteSpace(containers[0].DisplayName) ? "a container" : containers[0].DisplayName);
+            else
+            {
+                string plural = containers.All(c => c is StorageFurniture) ? "dressers"
+                    : containers.All(c => c is Chest chest && chest.fridge.Value) ? "mini-fridges"
+                    : containers.All(c => c is Chest) ? "chests"
+                    : "containers";
+                carried = $"in {containers.Count} {plural}";
+            }
+
+            if (!equipped)
+                return carried;
+            return carried.Length == 0 ? "equipped" : "equipped, " + carried;
+        }
+
+        /// <summary>The whole bracket note of a place: the kind of its containers (PlaceNote) and, if everything lies inside carried containers, where.</summary>
+        /// <param name="separator">", " in the place list; "; " for a Ginger Island area, whose areas are themselves separated by ", ".</param>
+        private string PlaceNoteWithNesting(string key, string separator = ", ")
+        {
+            return string.Join(separator, new[] { PlaceNote(key), PlaceNestNote(key) }.Where(part => part.Length > 0));
+        }
+
+        /// <summary>The row key of an item that lies inside a carried container: the container's name in front ("Mini-Fridge" + Apple).</summary>
+        private string RowKey(Item item, string? inside)
+        {
+            return inside == null ? RowKey(item) : inside + NestedRowSeparator + RowKey(item);
+        }
+
+        /// <summary>True for the row of an item inside a carried container.</summary>
+        private static bool IsNestedRow(string key) => key.IndexOf(NestedRowSeparator) >= 0;
+
+        /// <summary>
+        /// What stands in front of the icon of an item line: "Mini-Fridge > " for an item inside a carried container, "" for every other item. The
+        /// icon and the name follow it ("Mini-Fridge > [icon] Apple x3"), so the icon stands next to the item it shows.
+        /// </summary>
+        private static string RowPrefix(string key, SpriteFont font)
+        {
+            int nest = key.IndexOf(NestedRowSeparator);
+            if (nest < 0)
+                return "";
+            string sign = font.Characters.Contains('\u203A') ? " \u203A " : " > ";   // the game's font may not have the small angle
+            return key.Substring(0, nest) + sign;
         }
 
         /// <summary>The quality of a row key (0 for a row without one).</summary>
@@ -3987,181 +4860,75 @@ namespace ChestItemFinder
             CloseResultPanel();
         }
 
-        // ===================== BUTTON OF A FAILED SEARCH ("Check Backpack") =====================
-        // A search that finds nothing in the chests gets a "Check Backpack" button at the bottom of its panel, but ONLY when the backpack really holds
-        // something of it (looked at once when the search fails, never per frame). The button uses the game's own menu frame, with dark brown text,
-        // and gets a warm glow while the mouse is over it. A click is swallowed (no tool swing) and answers in the title:
-        //   Found:     "Found 'Apple' in your backpack!" with a small backpack in front of it.
-        //   Not found: "Not in chests, not in backpack." (the backpack is looked at again on the click: the player may have moved things meanwhile).
-        // The chest search is not repeated and the highlights are not touched. The button is gone after the click; the panel's countdown starts again.
-        // A WRONG STAR FILTER never gets here: when the chests hold the item but not in that quality, the search box stays open with the red hint
-        // "Item found, but no matching quality ..." (SearchOutcome.NoMatchingQuality), as it always did.
+        // ===================== BACKPACK AS A PLACE =====================
+        // The player's backpack is searched with the chests and is a place like any other:
+        //   - the place list names it first ("Backpack, Barn x2, Farm"): its distance is -1, nearer than every chest; it is one place, counted once;
+        //   - the player flashes like a chest (head to feet), in strips of the words' colors when several words are searched;
+        //   - it ends like a chest: opening the inventory page of the game menu is "opening" the backpack (OnMenuChanged): not locked, every highlight
+        //     goes; locked ("Keep highlights" checked), only the player's flash goes, and opening a found chest only removes that chest's highlight;
+        //     the timeout, a new search, a new day and unchecking "Keep highlights" end it like they end the chests' highlights;
+        //   - the arrow: the chest arrow shows the way to the nearest chest (the backpack is never the target of that arrow); on top of that, whenever
+        //     the backpack holds something of the search, a second arrow stands above the player's head and says "Backpack" (also while chests are
+        //     highlighted); the two keep out of each other's way;
+        //   - hovering the flashing player in the world lists what the backpack holds of the search, like hovering a highlighted chest does
+        //     ("Backpack total: 3", one line per item with its icon and count);
+        //   - only the backpack holds it: the title reads "Found your backpack containing 'egg'" with the small backpack in front, and the search is a
+        //     success (history, sounds, Keep box). A search that finds nothing anywhere fails as before (the backpack was searched with the chests).
 
-        private enum ResultAction { CheckBackpack }
+        private const string BackpackPlaceKey = "Backpack";
 
-        private const int ResultActionHeight = 52;   // button height (UI pixels): room for the menu frame (about 12 px) around the text
-        private const int ResultActionPadX = 26;     // text -> button edge (inside the frame)
-        private const int ResultActionGap = 14;      // between two buttons
-        private const long ResultActionFreshMs = 200;   // the buttons count as "on screen" if they were drawn this recently (real clock)
+        /// <summary>Only the backpack holds the search ("Found your backpack containing ..."): a small backpack in front of the title.</summary>
+        private bool resultBackpackIcon;
 
-        private string lastSearchQuery = "";            // the query of the search that is on the panel (without typed quality words)
-        private bool resultActionsOffered;              // the panel is a failed search: it offers the buttons
-        private bool backpackChecked;                   // "Check Backpack" was used for this result: that button is gone
-        private bool backpackHasMatch;                  // checked ONCE when the search failed (not every frame): the backpack holds something of it
-        private bool resultBackpackIcon;                // the title is the "Found ... in your backpack!" answer: a backpack in front of it
-        private readonly List<(Rectangle Bounds, ResultAction Action)> resultActionHitBoxes = new();
-        private long resultActionsDrawnMs = -1000;
+        // ===================== WORN ITEMS (part of the backpack) =====================
+        // What the player wears (hat, shirt, pants, boots, both rings, trinkets) is searched as part of the backpack place, like a dresser lying in
+        // the backpack: its rows are marked "Equipped > Iridium Band", and when everything found on the player is worn the place reads
+        // "Backpack (equipped)". The worn items are mirrored into one stand-in Chest that only exists for this (nothing is moved or cloned).
+        // Only the backpack has it.
+        private const string EquippedLabel = "Equipped";
+        private static Chest? equippedProxy;
 
-        /// <summary>The buttons the panel shows right now, with their label and width (empty unless the search found nothing).</summary>
-        private List<(ResultAction Action, string Label, int Width)> GetResultActionButtons()
+        /// <summary>True for the stand-in of the worn items.</summary>
+        private static bool IsEquippedProxy(Item? item) => item != null && equippedProxy != null && ReferenceEquals(item, equippedProxy);
+
+        /// <summary>The stand-in of the worn items, filled with what the player wears right now.</summary>
+        private static Chest GetEquippedProxy(Farmer player)
         {
-            var buttons = new List<(ResultAction, string, int)>();
-            if (!resultActionsOffered)
-                return buttons;
-
-            int Width(string label) => (int)Math.Ceiling(Game1.smallFont.MeasureString(label).X) + ResultActionPadX * 2;
-
-            if (!backpackChecked && backpackHasMatch)   // only when the backpack really holds it (checked once, when the search failed)
-                buttons.Add((ResultAction.CheckBackpack, "Check Backpack", Width("Check Backpack")));
-            return buttons;
-        }
-
-        /// <summary>One button, in the game's menu frame (see SearchMenu.DrawMenuButton).</summary>
-        private static void DrawResultActionButton(SpriteBatch b, Rectangle bounds, string label, bool hovered, float alpha)
-        {
-            SearchMenu.DrawMenuButton(b, bounds, label, hovered, alpha);
-        }
-
-        /// <summary>
-        /// The names of the backpack items the search matches (same rules, same star filter as the chest search), in backpack order, no duplicates.
-        /// Called once when a search fails and once when "Check Backpack" is clicked, never per frame.
-        /// </summary>
-        private List<string> FindInBackpack(string rawQuery, int quality)
-        {
-            var names = new List<string>();
-            Farmer? player = Game1.player;
-            if (player == null || string.IsNullOrWhiteSpace(rawQuery))
-                return names;
-
-            List<Item> backpack = player.Items.Where(i => i != null).Select(i => i!).ToList();
-            if (backpack.Count == 0)
-                return names;
-
-            Func<Item, bool> matches = BuildSearchMatcher(backpack, rawQuery, quality);
-            foreach (Item item in backpack)
+            equippedProxy ??= new Chest(false);
+            equippedProxy.Items.Clear();
+            var worn = new List<Item?> { player.hat.Value, player.shirtItem.Value, player.pantsItem.Value, player.boots.Value, player.leftRing.Value, player.rightRing.Value };
+            worn.AddRange(player.trinketItems);
+            foreach (Item? item in worn)
             {
-                if (!matches(item))
-                    continue;
-                string name = GetShownItemName(item);
-                if (!string.IsNullOrWhiteSpace(name) && !names.Contains(name, StringComparer.OrdinalIgnoreCase))
-                    names.Add(name);
+                if (item != null)
+                    equippedProxy.Items.Add(item);
             }
-            return names;
+            return equippedProxy;
         }
 
-        private void OnResultActionClicked(object? sender, ButtonPressedEventArgs e)
+        /// <summary>Everything the player carries (toolbar included), without the empty slots.</summary>
+        private List<Item> GetBackpackItems()
         {
-            if (IsHudClickTaken(e.Button))
-                return;   // the "Copy" bubble used this click
-            if (e.Button != SButton.MouseLeft)
-                return;
-            if (!Context.IsWorldReady || Game1.activeClickableMenu != null)
-                return;
-
-            long now = clock.ElapsedMilliseconds;
-            if (now - resultActionsDrawnMs > ResultActionFreshMs || now >= notifyUntilMs || !resultActionsOffered)
-                return;   // the buttons are not on screen right now
-
-            Point mouse = Game1.getMousePosition(true);
-            foreach (var (bounds, action) in resultActionHitBoxes.ToList())
+            try
             {
-                if (!bounds.Contains(mouse))
-                    continue;
-
-                Helper.Input.Suppress(e.Button);
-                Game1.playSound("smallSelect");
-
-                try
+                Farmer? player = Game1.player;
+                if (player != null)
                 {
-                    if (action == ResultAction.CheckBackpack)
-                        CheckBackpack();
+                    List<Item> items = player.Items.Where(i => i != null).Select(i => i!).ToList();
+                    Chest worn = GetEquippedProxy(player);
+                    if (worn.Items.Count > 0)
+                        items.Add(worn);   // what the player wears, as one more "container" of the backpack (see WORN ITEMS)
+                    return items;
                 }
-                catch (Exception ex)
-                {
-                    Monitor.Log($"The result panel button did not work: {ex.Message}", LogLevel.Warn);
-                    Monitor.Log(ex.ToString(), LogLevel.Trace);
-                }
-                return;
             }
+            catch (Exception ex)
+            {
+                Monitor.LogOnce($"Could not look into the backpack: {ex.Message}", LogLevel.Trace);
+            }
+            return new List<Item>();
         }
 
-        /// <summary>
-        /// "Check Backpack": the answer replaces the panel's title. The backpack is looked at once more (the player may have moved things since the
-        /// search), so the answer is always what it holds right now.
-        /// </summary>
-        private void CheckBackpack()
-        {
-            if (Game1.player == null || string.IsNullOrWhiteSpace(lastSearchQuery))
-                return;
-
-            List<string> names = FindInBackpack(lastSearchQuery, resultQuality);
-
-            backpackChecked = true;
-            notifyInvalidStart = -1;
-            notifyInvalidLength = 0;
-            notifyTailStart = -1;
-            notifyBody = "";
-
-            if (names.Count > 0)
-            {
-                const int maxNames = 3;
-                List<string> shown = names.Take(maxNames).ToList();
-                string suffix = names.Count > maxNames ? $" and {names.Count - maxNames} more in your backpack!" : " in your backpack!";
-                notifyTitle = BuildQuotedTitle("Found ", shown, shorten: true, suffix);   // the names are bold, like the names of a chest result
-                notifyEmphasisTips = shown.Select(n => (string?)GetTermTip(n)).ToList();
-                resultFailed = false;
-                resultBackpackIcon = true;
-                resultSuggestions = new List<(string Label, string Query)>();   // the item is there: no spelling guesses any more
-                resultSuggestionTips = new List<string?>();
-                Game1.playSound("drumkit6");
-            }
-            else
-            {
-                notifyTitle = "Not in chests, not in backpack.";
-                notifyEmphasis = new List<(int Start, int Length)>();
-                notifyEmphasisTerms = new List<string>();
-                notifyEmphasisTips = new List<string?>();
-                resultBackpackIcon = false;   // still a failed search: the warning sign stays, and so do the "Did you mean" words
-            }
-
-            notifyUntilMs = clock.ElapsedMilliseconds + 8000;   // time to read the answer
-        }
-
-        /// <summary>
-        /// The matcher of a search for a given set of items, built exactly like ScanChests builds it (the same term split, the same rules per term, the
-        /// same star filter: items that can never have a star ignore it).
-        /// </summary>
-        private Func<Item, bool> BuildSearchMatcher(List<Item> items, string rawQuery, int quality)
-        {
-            string itemName = NormalizeQueryText(rawQuery);
-            if (itemName.Length == 0)
-                return _ => false;
-
-            List<string> terms = ResolveTerms(items, itemName);
-            var termMatchers = new Func<Item, bool>[terms.Count];
-            for (int t = 0; t < terms.Count; t++)
-            {
-                bool searchable = terms.Count == 1 || SearchMenu.IsTermSearchable(terms[t]);
-                termMatchers[t] = searchable ? BuildSingleMatcher(items, terms[t]) : (_ => false);
-            }
-
-            Func<Item, bool> matches = CombineMatchers(termMatchers);
-            if (quality == AnyQuality)
-                return matches;
-            return i => matches(i) && (!CanHaveQuality(i) || i.Quality == quality);
-        }
-
-        // the small backpack in front of the "Found ... in your backpack!" title: 11 x 11 game pixels of 3 screen pixels, like the warning sign
+        // the small backpack in front of the "Found your backpack containing ..." title: 11 x 11 game pixels of 3 screen pixels, like the warning sign
         // ('#' outline, 'o' leather, 'g' buckle, '.' nothing)
         private static readonly string[] BackpackArt =
         {
@@ -4261,6 +5028,8 @@ namespace ChestItemFinder
             {
                 IsKeepHighlightsLocked = false;
                 highlightedChests.Clear();
+                highlightBackpack = false;
+                backpackWordSlots = Array.Empty<int>();
                 highlightMatcher = null;
                 singleItemQualityRows = false;
                 chestTipSamples.Clear();
@@ -4268,7 +5037,9 @@ namespace ChestItemFinder
                 placeSamples.Clear();
                 placeKindCounts.Clear();
                 placeSectionItems.Clear();
+                placeNesting.Clear();
                 placeEntries = new List<PlaceEntry>();
+                lostOnDeathNote = "";
                 return new SearchReport(SearchOutcome.Done);
             }
 
@@ -4285,9 +5056,12 @@ namespace ChestItemFinder
             }
 
             var allItems = allChests
-                .SelectMany(c => c.chest.Items)
-                .Where(i => i != null)
+                .SelectMany(c => ItemsWithNested(c.chest.Items))   // with what carried containers inside them hold (see CONTAINERS INSIDE CONTAINERS)
                 .ToList();
+
+            // the backpack is a place too (see BACKPACK AS A PLACE): its items are part of the pool, so a word that only the backpack holds is found
+            List<Item> backpackItems = GetBackpackItems();
+            allItems.AddRange(ItemsWithNested(backpackItems));
 
             // one term = the search as it always was; several terms (commas or spaces) = an item counts if it matches ANY of them.
             // At most three (see AT MOST THREE AT A TIME): the rest is named in the last line of the result panel
@@ -4356,22 +5130,53 @@ namespace ChestItemFinder
             EndKeepFade();                    // nothing of the old box (fade, saved chests) is left
             resultQuality = quality;   // the panel's quality icon (every search shows one, "any quality" included)
             resultFailed = false;
-            lastSearchQuery = rawQuery;      // what the "Check Backpack" button of a failed search looks for
-            resultActionsOffered = false;    // set again below if this search finds nothing
-            backpackChecked = false;
-            backpackHasMatch = false;
             resultBackpackIcon = false;
             resultSuggestions = new List<(string Label, string Query)>();   // only a failed search gets "Did you mean" words (set below)
             resultSuggestionTips = new List<string?>();
             resultHintLead = DidYouMeanLabel;
             resultHasNoQualityItemsOnly = false;
             highlightedChests.Clear();
+            highlightBackpack = false;
+            backpackWordSlots = Array.Empty<int>();
             highlightMatcher = matches;   // the hover tip of a highlighted chest lists exactly what this search matched (star filter included)
+
+            // several words that found something: every one gets its color, in the order typed (see SEVERAL WORDS, SEVERAL COLORS)
+            highlightWordCount = validTerms.Count >= 2 ? Math.Min(validTerms.Count, MaxSearchTerms) : 0;
+            termWordSlot = new int[terms.Count];
+            for (int t = 0; t < terms.Count; t++)
+            {
+                int termSlot = highlightWordCount > 0 ? validTerms.IndexOf(terms[t]) : -1;
+                termWordSlot[t] = termSlot < highlightWordCount ? termSlot : -1;
+            }
+            chestWordSlots.Clear();
+            itemWordSlots = new Dictionary<string, int>();
+            highlightLabelWords = new List<string>();
+
+            // the word an item belongs to (its color): an item word (not a category) that finds it comes first, so with "fruit, mango" Mango is
+            // Mango's color and every other fruit is the fruit color; else the first word that finds it. -1 = no color.
+            bool[] termIsItemWord = terms.Select(term => !IsCategoryWord(StripCategorySuffix(term))).ToArray();
+            int OwnerSlot(Item item)
+            {
+                int firstFound = -1;
+                for (int wordIdx = 0; wordIdx < terms.Count; wordIdx++)
+                {
+                    if (termWordSlot[wordIdx] < 0 || !termMatchers[wordIdx](item))
+                        continue;
+                    if (termIsItemWord[wordIdx])
+                        return termWordSlot[wordIdx];
+                    if (firstFound < 0)
+                        firstFound = termWordSlot[wordIdx];
+                }
+                return firstFound;
+            }
+            titleEmphasisSlots = Array.Empty<int>();
+            coloredTitle = "";
             chestTipSamples.Clear();
             placeItems.Clear();
             placeSamples.Clear();
             placeKindCounts.Clear();
             placeSectionItems.Clear();
+            placeNesting.Clear();
             placeEntries = new List<PlaceEntry>();
 
             bool anyQualityCapableMatch = false;   // at least one matched item can carry a star (Corn, Fish, ...)
@@ -4420,11 +5225,20 @@ namespace ChestItemFinder
             // is still ONE found chest, ONE highlight and one set of item totals, because the words are combined into ONE matcher ("matches")
             foreach (var (location, position, chest, label) in allChests)
             {
-                bool chestHasItem = chest.Items.Any(i => i != null && matches(i));
+                bool chestHasItem = ItemsWithNested(chest.Items).Any(i => matches(i));
                 if (!chestHasItem) continue;
 
                 highlightedChests.Add((location, position, chest));
-                if (!anyQualityCapableMatch && chest.Items.Any(i => i != null && matches(i) && CanHaveQuality(i)))
+                if (highlightWordCount > 0)
+                {
+                    // the words of the items this chest holds (with the chosen star; an item counts for its own word, see OwnerSlot), in the
+                    // order typed: the strips of its flash
+                    chestWordSlots[chest] = StripOrder(ItemsWithNested(chest.Items)
+                        .Where(i => matches(i))
+                        .Select(OwnerSlot)
+                        .Where(slot => slot >= 0));
+                }
+                if (!anyQualityCapableMatch && ItemsWithNested(chest.Items).Any(i => matches(i) && CanHaveQuality(i)))
                     anyQualityCapableMatch = true;
                 string? islandArea = GetIslandArea(location.Name);
                 string placeKey = islandArea != null ? IslandKeyPrefix + islandArea : label;
@@ -4444,13 +5258,36 @@ namespace ChestItemFinder
                 found++;
             }
 
+            // the backpack, a place of its own (see BACKPACK AS A PLACE): it is nearer than everything (distance -1: first in the place list),
+            // it counts once, and the player flashes (in the colors of the words the backpack holds)
+            List<Item> backpackMatches = ItemsWithNested(backpackItems).Where(i => matches(i)).ToList();
+            bool backpackFound = backpackMatches.Count > 0;
+            if (backpackFound)
+            {
+                highlightBackpack = true;
+                if (highlightWordCount > 0)
+                {
+                    backpackWordSlots = StripOrder(backpackMatches
+                        .Select(OwnerSlot)
+                        .Where(slot => slot >= 0));
+                }
+                if (!anyQualityCapableMatch && backpackMatches.Any(CanHaveQuality))
+                    anyQualityCapableMatch = true;
+                AddMatchingItems(BackpackPlaceKey, backpackItems, matches);
+                mainCounts[BackpackPlaceKey] = 1;
+                mainDistances[BackpackPlaceKey] = -1f;
+            }
+
+            // what the search matches among the items Marlon can sell back (lost on the last death): one note line at the end of the panel
+            lostOnDeathNote = BuildLostOnDeathNote(matches);
+
             // the search only refers to items without quality (found: every matched chest item has none; not found: every game item the words
             // match has none): the star filter does not apply, and the panel says so (see resultHasNoQualityItemsOnly)
-            resultHasNoQualityItemsOnly = found > 0
+            resultHasNoQualityItemsOnly = (found > 0 || backpackFound)
                 ? !anyQualityCapableMatch
                 : SearchRefersOnlyToNoQualityItems(terms);
 
-            if (found == 0)
+            if (found == 0 && !backpackFound)
             {
                 // say what was searched for, so a typo ("satrfruit") is easy to spot; a very long word is cut short so the title stays readable.
                 // Two different failures, never mixed up:
@@ -4472,18 +5309,6 @@ namespace ChestItemFinder
                 }
                 notifyBody = "";
                 resultFailed = true;         // the warning icon at the left end of the title row
-                resultActionsOffered = true; // the "Check Backpack" button under the text (only if the backpack holds it, see below)
-
-                // the backpack is looked at ONCE, right now: "Check Backpack" is only offered when it really holds something of this search
-                try
-                {
-                    backpackHasMatch = FindInBackpack(rawQuery, quality).Count > 0;
-                }
-                catch (Exception ex)
-                {
-                    backpackHasMatch = false;
-                    Monitor.Log($"Could not look into the backpack: {ex.Message}", LogLevel.Trace);
-                }
                 resultSuggestions = BuildSpellingSuggestions(terms, invalidTerms, itemName);   // "Did you mean: ..." under the title
                 resultSuggestionTips = resultSuggestions.Select(s => GetTermTip(s.Label)).ToList();
                 PlaySearchFeedback(false);   // nothing found: one short "dead end" sound
@@ -4493,8 +5318,11 @@ namespace ChestItemFinder
                 // Something was found, so the search is a success, however many of the words found nothing. The title lists the words that found
                 // something, each in its own quotes and bold; the words that found nothing (or could not be searched) follow in dark red:
                 // Found 15 chests containing 'fruit' (Invalid: 'ere', 'df')
-                string chestWord = ContainerWord(highlightedChests.Select(h => h.chest).ToList());   // "fridge(s)" if only fridges were found, else "chest(s)"
-                string foundPrefix = $"Found {found} {chestWord} containing ";
+                // only the backpack holds it: "Found your backpack containing 'egg'" with the small backpack in front of the title
+                string foundPrefix = found > 0
+                    ? $"Found {found} {ContainerWord(highlightedChests.Select(h => h.chest).ToList())} containing "   // "fridge(s)" if only fridges were found, else "chest(s)"
+                    : "Found your backpack containing ";
+                resultBackpackIcon = found == 0;
                 // a single category search ("fish", "fruit", "artisan goods" ...) gets the same " (category)" label as the auto-complete, after the
                 // closing quote: 'fish' (category); a real item name gets none. With several words the title lists them, each in its own quotes and
                 // bold, and if at least one of them is a category the title gets ONE " (categories)" (a label after every word would make
@@ -4503,9 +5331,35 @@ namespace ChestItemFinder
                 var (orderedTerms, labelAfter, midLabel, endLabel) = LabelCategories(validTerms);
                 notifyTitle = BuildQuotedTitle(foundPrefix, orderedTerms, shorten: false, endLabel, invalidTerms, noItemCategoryTerms, noItemNameTerms,
                     labelAfter, midLabel);
-                notifyBody = BuildPlaceSummary(mainCounts, islandCounts, mainDistances, islandDistances, PlaceNote, area => PlaceNote(IslandKeyPrefix + area));
+                if (highlightWordCount > 0)
+                {
+                    // the words of the main sentence get their colors; the bracketed groups after it (found nothing, invalid) never do
+                    titleEmphasisSlots = new int[notifyEmphasis.Count];
+                    for (int wordIndex = 0; wordIndex < notifyEmphasis.Count; wordIndex++)
+                    {
+                        bool inMainSentence = notifyTailStart < 0 || notifyEmphasis[wordIndex].Start < notifyTailStart;
+                        int wordSlot = inMainSentence && wordIndex < notifyEmphasisTerms.Count ? validTerms.IndexOf(notifyEmphasisTerms[wordIndex]) : -1;
+                        titleEmphasisSlots[wordIndex] = wordSlot < highlightWordCount ? wordSlot : -1;
+                    }
+                    coloredTitle = notifyTitle;
+                }
+                notifyBody = BuildPlaceSummary(mainCounts, islandCounts, mainDistances, islandDistances, key => PlaceNoteWithNesting(key), area => PlaceNoteWithNesting(IslandKeyPrefix + area, "; "));
                 placeItemOrder = BuildPlaceItemOrder(terms, termMatchers, allItems);
+                if (highlightWordCount > 0)
+                {
+                    foreach (Dictionary<string, Item> placeSampleSet in placeSamples.Values)
+                    {
+                        foreach (var (rowKey, sample) in placeSampleSet)
+                        {
+                            string foundName = RowName(rowKey);
+                            int owner = itemWordSlots.ContainsKey(foundName) ? -1 : OwnerSlot(sample);
+                            if (owner >= 0)
+                                itemWordSlots[foundName] = owner;
+                        }
+                    }
+                }
                 highlightLabel = string.Join(", ", validTerms.Take(3).Select(t => "'" + StripCategorySuffix(t) + "'")) + (validTerms.Count > 3 ? ", ..." : "");
+                highlightLabelWords = highlightWordCount > 0 ? validTerms.Take(highlightWordCount).Select(t => "'" + StripCategorySuffix(t) + "'").ToList() : new List<string>();
                 placeEntries = ParsePlaceEntries(notifyBody, name => placeItems.ContainsKey(name));
                 PlaySearchFeedback(true);    // found: coin + pick-up sounds and a few gold stars beside the panel
             }
@@ -4514,13 +5368,14 @@ namespace ChestItemFinder
             BuildEmphasisTips(allItems, terms, termMatchers, qualityOk, invalidTerms, noItemCategoryTerms);
 
             notifyUntilMs = clock.ElapsedMilliseconds + 8000;
-            highlightUntilMs = (found > 0 && Config.HighlightTimeoutSeconds > 0)
+            highlightUntilMs = ((found > 0 || backpackFound) && Config.HighlightTimeoutSeconds > 0)
                 ? clock.ElapsedMilliseconds + Config.HighlightTimeoutSeconds * 1000L
                 : -1;
-            Monitor.Log(notifyTitle + (notifyBody.Length > 0 ? " | " + notifyBody : ""), LogLevel.Info);
+            if (!consoleSearchRunning)   // the console command writes its own, longer list (see CONSOLE SEARCH)
+                Monitor.Log(notifyTitle + (notifyBody.Length > 0 ? " | " + notifyBody : ""), LogLevel.Info);
 
             // history: the search menu remembers every word that could be searched (terms), whether it found something or not
-            return new SearchReport(SearchOutcome.Done, found > 0 ? validTerms : new List<string>(), terms);
+            return new SearchReport(SearchOutcome.Done, (found > 0 || backpackFound) ? validTerms : new List<string>(), terms);
         }
 
         // ===================== GAME ITEM CATALOG (only used to tell whether a search is about items without quality) =====================
@@ -4663,15 +5518,28 @@ namespace ChestItemFinder
         // Adds the matching items of one chest to the running totals of its place (same item name = one line, counts add up).
         private void AddMatchingItems(string placeKey, Chest chest, Func<Item, bool> matches)
         {
+            AddMatchingItems(placeKey, chest.Items, matches);
+        }
+
+        private void AddMatchingItems(string placeKey, IEnumerable<Item?> items, Func<Item, bool> matches)
+        {
             if (!placeItems.TryGetValue(placeKey, out Dictionary<string, int>? totals))
                 placeItems[placeKey] = totals = new Dictionary<string, int>();
             if (!placeSamples.TryGetValue(placeKey, out Dictionary<string, Item>? samples))
                 placeSamples[placeKey] = samples = new Dictionary<string, Item>();
 
-            foreach (Item? item in chest.Items)
+            if (!placeNesting.TryGetValue(placeKey, out var nesting))
+                placeNesting[placeKey] = nesting = (false, new List<Item>());
+
+            foreach (var (item, inside, container) in WithNested(items))
             {
-                if (item == null || !matches(item)) continue;
-                string name = RowKey(item);   // the item name, or name + quality (see ONE ROW PER QUALITY)
+                if (!matches(item)) continue;
+                if (container == null)
+                    nesting.Direct = true;
+                else if (!nesting.Containers.Any(c => ReferenceEquals(c, container)))
+                    nesting.Containers.Add(container);
+                placeNesting[placeKey] = nesting;
+                string name = RowKey(item, inside);   // the item name, or name + quality (see ONE ROW PER QUALITY); inside a carried container marked so
                 totals[name] = totals.GetValueOrDefault(name) + item.Stack;
                 if (!samples.ContainsKey(name))
                     samples[name] = MakeIconSample(item, singleItemQualityRows);
@@ -4742,10 +5610,10 @@ namespace ChestItemFinder
             if (!sections.TryGetValue(kind.SectionKey, out Dictionary<string, int>? totals))
                 sections[kind.SectionKey] = totals = new Dictionary<string, int>();
 
-            foreach (Item? item in chest.Items)
+            foreach (var (item, inside, _) in WithNested(chest.Items))
             {
-                if (item == null || !matches(item)) continue;
-                string name = RowKey(item);
+                if (!matches(item)) continue;
+                string name = RowKey(item, inside);
                 totals[name] = totals.GetValueOrDefault(name) + item.Stack;
             }
         }
@@ -5485,7 +6353,7 @@ namespace ChestItemFinder
             foreach (var (_, _, chest, _) in GetAllContainers())
             {
                 if (chest.Items != null)
-                    items.AddRange(chest.Items.Where(i => i != null));
+                    items.AddRange(ItemsWithNested(chest.Items));
             }
             return items;
         }
@@ -5725,298 +6593,6 @@ namespace ChestItemFinder
             return false;
         }
 
-        // ===================== ORDER OF THE ITEMS IN A "Showing results for:" TIP =====================
-        // Not alphabetical and not by id: the things a player uses most come first.
-        //   tier 1  crops, fruit, vegetables, forage and mushrooms, flowers, fish, gems and minerals, ores, bars, coal, wood, stone, animal products,
-        //           seeds, monster loot (the everyday resources)
-        //   tier 2  artisan goods and other processed things (Wine, Jelly, Juice, Cheese, Mayonnaise, Honey, Roe, syrups, ingredients)
-        //   tier 3  tools, weapons, machines and other big craftables, crafted items, bait, tackle, fertilizer, rings, boots, trinkets, books, artifacts
-        //   tier 4  cooked dishes
-        //   tier 5  decoration: paths, floors, fences, gates; trash
-        //   tier 6  furniture, hats, clothing (they only show when nothing more useful fills the list)
-        // Inside a tier: early-game items that are used all the time first (Crystal Fruit, Salmonberry), core late-game items in the middle
-        // (Ancient Fruit, Starfruit), and late, mostly-for-fun items at the very end (Qi Fruit), see GetProgressScore.
-
-        private static readonly HashSet<int> TierOneCategories = new() { -79, -75, -81, -80, -4, -2, -12, -15, -16, -5, -6, -18, -14, -17, -74, -28 };
-        private static readonly HashSet<int> TierTwoCategories = new() { -26, -27, -23, -25 };
-        private static readonly HashSet<int> TierThreeCategories = new() { -8, -9, -19, -21, -22, -29, -96, -97, -98, -99, -101, -102, -103 };
-
-        /// <summary>Name endings of decoration crafts (paths, floors, fences ...): tier 5, even though the game files them under "crafting".</summary>
-        private static readonly string[] DecorNameEndings = { "Path", "Floor", "Flooring", "Fence", "Gate", "Brazier", "Stepping Stone", "Walkway" };
-
-        /// <summary>1 = used the most ... 6 = furniture / clothing (see the block comment above).</summary>
-        private static int GetUsageTier(Item item)
-        {
-            string type = item.TypeDefinitionId ?? "";
-            if (type == "(F)" || type == "(H)" || type == "(S)" || type == "(P)" || item.Category == -24 && type != "(O)" || item.Category == -95 || item.Category == -100)
-                return 6;
-            if (type == "(T)" || type == "(W)" || type == "(B)" || type == "(TR)" || type == "(BC)")
-                return 3;
-
-            string name = item.Name ?? "";
-            if (DecorNameEndings.Any(ending => name.EndsWith(ending, StringComparison.OrdinalIgnoreCase)) || item.Category == -24 || item.Category == -20)
-                return 5;
-
-            if (TierOneCategories.Contains(item.Category))
-                return 1;
-            if (TierTwoCategories.Contains(item.Category))
-                return 2;
-            if (TierThreeCategories.Contains(item.Category))
-                return 3;
-            if (item.Category == -7)
-                return 4;
-            if (item is StardewValley.Object obj && string.Equals(obj.Type, "Arch", StringComparison.OrdinalIgnoreCase))
-                return 3;   // artifacts
-
-            return 4;
-        }
-
-        /// <summary>
-        /// When a player meets an item and how much they use it, inside its tier: 0 = from the first days and used all the time ... 100 = late and
-        /// mostly for fun. Known items have a fixed value (by the game's internal English name, so this works in every language); any other item is
-        /// judged by its sell price (cheap = early), and names of late-game things (Qi, Radioactive, Prismatic, Galaxy, legendary fish ...) go to the end.
-        /// </summary>
-        private static int GetProgressScore(Item item)
-        {
-            string name = item.Name ?? "";
-            if (ProgressOverrides.TryGetValue(name, out int fixedScore))
-                return fixedScore;
-
-            int price = item is StardewValley.Object obj ? obj.Price : 0;
-            int score = price <= 0 ? 45
-                : price <= 40 ? 15
-                : price <= 100 ? 22
-                : price <= 200 ? 32
-                : price <= 400 ? 44
-                : price <= 800 ? 56
-                : 68;
-
-            if (item.Category == -74)
-                score = Math.Min(score + 10, 80);   // seeds come a little after what they grow into
-
-            bool late = LateNameMarks.Any(mark => name.Contains(mark, StringComparison.OrdinalIgnoreCase))
-                || name.StartsWith("Qi ", StringComparison.Ordinal)
-                || item.HasContextTag("fish_legendary") || item.HasContextTag("fish_legendary_family");
-            return late ? Math.Max(score, 88) : score;
-        }
-
-        private static readonly string[] LateNameMarks = { "Radioactive", "Prismatic", "Galaxy", "Infinity", "Dragon", "Magma", "Void", "Golden Walnut", "Mystic", "Legend" };
-
-        /// <summary>Fixed progress values of well-known items (internal English names). Lower = earlier and more used.</summary>
-        private static readonly Dictionary<string, int> ProgressOverrides = new(StringComparer.OrdinalIgnoreCase)
-        {
-            // everyday resources
-            ["Wood"] = 0,
-            ["Stone"] = 0,
-            ["Fiber"] = 1,
-            ["Sap"] = 2,
-            ["Coal"] = 3,
-            ["Clay"] = 4,
-            ["Hardwood"] = 6,
-            ["Copper Ore"] = 4,
-            ["Iron Ore"] = 8,
-            ["Gold Ore"] = 14,
-            ["Iridium Ore"] = 40,
-            ["Copper Bar"] = 5,
-            ["Iron Bar"] = 9,
-            ["Gold Bar"] = 15,
-            ["Iridium Bar"] = 42,
-            ["Refined Quartz"] = 10,
-            ["Quartz"] = 5,
-            ["Earth Crystal"] = 6,
-            ["Frozen Tear"] = 10,
-            ["Fire Quartz"] = 14,
-            ["Amethyst"] = 6,
-            ["Topaz"] = 6,
-            ["Aquamarine"] = 10,
-            ["Jade"] = 10,
-            ["Emerald"] = 12,
-            ["Ruby"] = 12,
-            ["Diamond"] = 16,
-            ["Prismatic Shard"] = 80,
-            ["Egg"] = 2,
-            ["Large Egg"] = 4,
-            ["Brown Egg"] = 2,
-            ["Large Brown Egg"] = 4,
-            ["Milk"] = 3,
-            ["Large Milk"] = 5,
-            ["Goat Milk"] = 8,
-            ["L. Goat Milk"] = 10,
-            ["Wool"] = 10,
-            ["Duck Egg"] = 9,
-            ["Duck Feather"] = 12,
-            ["Rabbit's Foot"] = 20,
-            ["Truffle"] = 14,
-            ["Void Egg"] = 60,
-            ["Dinosaur Egg"] = 70,
-            ["Golden Egg"] = 80,
-            ["Ostrich Egg"] = 65,
-            // forage and mushrooms
-            ["Wild Horseradish"] = 1,
-            ["Daffodil"] = 1,
-            ["Leek"] = 1,
-            ["Dandelion"] = 1,
-            ["Salmonberry"] = 2,
-            ["Spring Onion"] = 2,
-            ["Grape"] = 4,
-            ["Spice Berry"] = 3,
-            ["Sweet Pea"] = 3,
-            ["Blackberry"] = 3,
-            ["Hazelnut"] = 4,
-            ["Wild Plum"] = 4,
-            ["Common Mushroom"] = 3,
-            ["Crystal Fruit"] = 5,
-            ["Crocus"] = 5,
-            ["Holly"] = 5,
-            ["Snow Yam"] = 6,
-            ["Winter Root"] = 6,
-            ["Chanterelle"] = 6,
-            ["Morel"] = 6,
-            ["Red Mushroom"] = 8,
-            ["Purple Mushroom"] = 12,
-            ["Cave Carrot"] = 8,
-            ["Coconut"] = 30,
-            ["Cactus Fruit"] = 32,
-            ["Magma Cap"] = 82,
-            // crops
-            ["Parsnip"] = 0,
-            ["Potato"] = 1,
-            ["Green Bean"] = 1,
-            ["Cauliflower"] = 2,
-            ["Kale"] = 2,
-            ["Garlic"] = 3,
-            ["Strawberry"] = 4,
-            ["Rhubarb"] = 20,
-            ["Blueberry"] = 3,
-            ["Melon"] = 4,
-            ["Tomato"] = 3,
-            ["Hot Pepper"] = 3,
-            ["Corn"] = 4,
-            ["Wheat"] = 3,
-            ["Radish"] = 4,
-            ["Hops"] = 6,
-            ["Red Cabbage"] = 10,
-            ["Poppy"] = 6,
-            ["Summer Spangle"] = 6,
-            ["Sunflower"] = 6,
-            ["Pumpkin"] = 4,
-            ["Cranberries"] = 4,
-            ["Eggplant"] = 5,
-            ["Yam"] = 5,
-            ["Bok Choy"] = 5,
-            ["Amaranth"] = 6,
-            ["Artichoke"] = 12,
-            ["Beet"] = 20,
-            ["Fairy Rose"] = 8,
-            ["Tulip"] = 2,
-            ["Blue Jazz"] = 2,
-            ["Coffee Bean"] = 14,
-            ["Rice"] = 10,
-            ["Unmilled Rice"] = 10,
-            ["Tea Leaves"] = 16,
-            ["Starfruit"] = 45,
-            ["Ancient Fruit"] = 52,
-            ["Sweet Gem Berry"] = 66,
-            ["Taro Root"] = 62,
-            ["Pineapple"] = 64,
-            ["Ginger"] = 58,
-            ["Powdermelon"] = 20,
-            ["Carrot"] = 3,
-            ["Summer Squash"] = 5,
-            ["Broccoli"] = 6,
-            ["Qi Fruit"] = 96,
-            ["Qi Bean"] = 96,
-            // fruit trees
-            ["Cherry"] = 8,
-            ["Apricot"] = 8,
-            ["Orange"] = 9,
-            ["Peach"] = 9,
-            ["Apple"] = 9,
-            ["Pomegranate"] = 10,
-            ["Banana"] = 60,
-            ["Mango"] = 62,
-            // fish (the common ones; legendary fish are late via their tag)
-            ["Sardine"] = 2,
-            ["Anchovy"] = 2,
-            ["Carp"] = 2,
-            ["Bream"] = 2,
-            ["Sunfish"] = 2,
-            ["Herring"] = 3,
-            ["Chub"] = 3,
-            ["Smallmouth Bass"] = 3,
-            ["Largemouth Bass"] = 4,
-            ["Rainbow Trout"] = 4,
-            ["Catfish"] = 5,
-            ["Salmon"] = 4,
-            ["Perch"] = 5,
-            ["Pike"] = 5,
-            ["Walleye"] = 6,
-            ["Tuna"] = 6,
-            ["Red Snapper"] = 5,
-            ["Tilapia"] = 6,
-            ["Eel"] = 6,
-            ["Squid"] = 6,
-            ["Halibut"] = 6,
-            ["Flounder"] = 7,
-            ["Red Mullet"] = 6,
-            ["Shad"] = 6,
-            ["Pufferfish"] = 12,
-            ["Tiger Trout"] = 10,
-            ["Ghostfish"] = 12,
-            ["Stonefish"] = 20,
-            ["Ice Pip"] = 24,
-            ["Lava Eel"] = 40,
-            ["Sandfish"] = 30,
-            ["Scorpion Carp"] = 34,
-            ["Sturgeon"] = 14,
-            ["Dorado"] = 12,
-            ["Albacore"] = 8,
-            ["Midnight Carp"] = 10,
-            ["Woodskip"] = 10,
-            ["Blobfish"] = 50,
-            ["Midnight Squid"] = 50,
-            ["Spook Fish"] = 50,
-            ["Stingray"] = 60,
-            ["Lionfish"] = 60,
-            ["Blue Discus"] = 60,
-            // processed goods
-            ["Wine"] = 2,
-            ["Jelly"] = 2,
-            ["Juice"] = 3,
-            ["Pickles"] = 3,
-            ["Cheese"] = 2,
-            ["Goat Cheese"] = 5,
-            ["Mayonnaise"] = 1,
-            ["Duck Mayonnaise"] = 8,
-            ["Honey"] = 4,
-            ["Beer"] = 4,
-            ["Pale Ale"] = 5,
-            ["Coffee"] = 6,
-            ["Cloth"] = 8,
-            ["Oil"] = 6,
-            ["Truffle Oil"] = 10,
-            ["Maple Syrup"] = 8,
-            ["Oak Resin"] = 8,
-            ["Pine Tar"] = 8,
-            ["Mead"] = 8,
-            ["Roe"] = 10,
-            ["Aged Roe"] = 12,
-            ["Caviar"] = 30,
-            ["Green Tea"] = 16,
-            ["Void Mayonnaise"] = 60,
-            ["Dinosaur Mayonnaise"] = 70
-        };
-
-        /// <summary>False for things in the game's item list that can never lie in a chest (quest items, weeds / twigs / stones, error items).</summary>
-        private static bool IsListableItem(Item item)
-        {
-            if (item.Category == -999)
-                return false;
-            if (item is StardewValley.Object obj && string.Equals(obj.Type, "Quest", StringComparison.OrdinalIgnoreCase))
-                return false;
-            return !(ItemRegistry.GetData(item.QualifiedItemId)?.IsErrorItem ?? true);
-        }
-
         /// <summary>
         /// What a category word is called in the tips: "fruit" -> "Fruit", "artisan" -> "Artisan Goods", "gems" -> "Gem", "trash" -> "Trash". The word is
         /// looked up in the auto-complete's category words (the spelling a player types), first by itself, then by the category it stands for.
@@ -6122,6 +6698,9 @@ namespace ChestItemFinder
                     string? termTip = BuildTermTip(term, invalidTerms.Contains(term), noItemCategoryTerms.Contains(term), matchesTerm, matchesTerm != null ? allItems : null);
                     if (searchAliasNotes.TryGetValue(Norm(term), out string? aliasNote))   // searched by an alias: first say that it is the same thing
                         termTip = termTip == null ? aliasNote : aliasNote + "\n" + termTip;
+                    string? ownColorNote = t >= 0 && matchesTerm != null ? OwnColorNote(t, terms, termMatchers, matchesTerm, allItems) : null;
+                    if (ownColorNote != null)   // "fruit, mango": Mango is fruit too, but keeps its own color (see OwnerSlot in ScanChests)
+                        termTip = termTip == null ? ownColorNote : termTip + "\n" + ownColorNote;
                     tips.Add(termTip);
                 }
             }
@@ -6134,6 +6713,31 @@ namespace ChestItemFinder
             while (tips.Count < notifyEmphasis.Count)
                 tips.Add(null);
             notifyEmphasisTips = tips;
+        }
+
+        /// <summary>
+        /// The last line of the tip of an item word in a search with several words, when a category word of the same search also finds its items
+        /// ("fruit, mango"): It belongs to 'fruit', which you also searched, so it is marked in its own color. Null otherwise.
+        /// </summary>
+        private string? OwnColorNote(int t, List<string> terms, Func<Item, bool>[] termMatchers, Func<Item, bool> matchesTerm, List<Item> allItems)
+        {
+            if (highlightWordCount <= 0 || t >= termWordSlot.Length || termWordSlot[t] < 0 || IsCategoryWord(StripCategorySuffix(terms[t])))
+                return null;
+
+            var categories = new List<string>();
+            for (int c = 0; c < terms.Count && c < termWordSlot.Length; c++)
+            {
+                if (c == t || termWordSlot[c] < 0 || !IsCategoryWord(StripCategorySuffix(terms[c])))
+                    continue;
+                Func<Item, bool> categoryMatcher = termMatchers[c];
+                if (allItems.Any(i => matchesTerm(i) && categoryMatcher(i)))
+                    categories.Add("'" + StripCategorySuffix(terms[c]) + "'");
+            }
+            if (categories.Count == 0)
+                return null;
+            // the line above already names its category; this only says why its color is not the category's
+            string categoryNames = categories.Count == 1 ? categories[0] : string.Join(", ", categories.Take(categories.Count - 1)) + " and " + categories[^1];
+            return $"It belongs to {categoryNames}, which you also searched, so it is marked in its own color.";
         }
 
         /// <summary>
@@ -6351,6 +6955,59 @@ namespace ChestItemFinder
             return notifyInvalidLength > 0 && titleIndex >= notifyInvalidStart && titleIndex < notifyInvalidStart + notifyInvalidLength;
         }
 
+        /// <summary>True while the title has words in the colors of a search with several words (see SEVERAL WORDS, SEVERAL COLORS).</summary>
+        private bool HasColoredTitleWords()
+        {
+            return titleEmphasisSlots.Length > 0 && titleEmphasisSlots.Length == notifyEmphasis.Count && notifyTitle == coloredTitle
+                && titleEmphasisSlots.Any(slot => slot >= 0);
+        }
+
+        // Several words: a mark in the flash color of each word behind the word in the title, like a highlighter pen (the text itself keeps its
+        // normal color). Drawn BEFORE the title text. One mark per line the word lies on (a word with spaces can be split over two lines).
+        private void DrawTitleMarks(SpriteBatch b, string wrappedTitle, Vector2 titlePos, float scale, float alpha)
+        {
+            if (!HasColoredTitleWords() || !TryMapTitleLetters(wrappedTitle, out int[] lineOf, out int[] colOf))
+                return;
+
+            string[] lines = wrappedTitle.Replace("\r", "").Split('\n');
+            SpriteFont font = Game1.dialogueFont;
+            float lineHeight = font.LineSpacing * scale;
+
+            for (int e = 0; e < notifyEmphasis.Count; e++)
+            {
+                int slot = titleEmphasisSlots[e];
+                (int first, int length) = notifyEmphasis[e];
+                if (slot < 0 || length <= 0 || first < 0 || first + length > notifyTitle.Length)
+                    continue;
+
+                // per line: the first and the last column of the word's letters there
+                var spans = new Dictionary<int, (int From, int To)>();
+                for (int idx = first; idx < first + length; idx++)
+                {
+                    if (char.IsWhiteSpace(notifyTitle[idx]))
+                        continue;
+                    int line = lineOf[idx];
+                    int col = colOf[idx];
+                    spans[line] = spans.TryGetValue(line, out var span) ? (Math.Min(span.From, col), Math.Max(span.To, col)) : (col, col);
+                }
+
+                Color mark = WordFlashColor(slot) * (WordMarkAlpha * alpha);
+                foreach (var (line, (from, to)) in spans)
+                {
+                    if (line < 0 || line >= lines.Length)
+                        continue;
+                    string text = lines[line];
+                    int colEnd = Math.Min(to + 1, text.Length);
+                    if (from < 0 || from >= colEnd)
+                        continue;
+                    float x = titlePos.X + font.MeasureString(text.Substring(0, from)).X * scale;
+                    float w = font.MeasureString(text.Substring(from, colEnd - from)).X * scale;
+                    float y = titlePos.Y + line * lineHeight;
+                    b.Draw(Game1.staminaRect, new Rectangle((int)x - 3, (int)(y + lineHeight * 0.12f), (int)Math.Ceiling(w) + 6, (int)(lineHeight * 0.8f)), mark);
+                }
+            }
+        }
+
         // Draws the title text (with the game's text shadow). A title without an "(Invalid: ...)" part is drawn in one go in the normal color.
         // With one, every wrapped line is cut at the first and the last letter of that part and drawn in up to three pieces (normal / invalid /
         // normal), each placed by measuring the text before it, the same way DrawTitleEmphasis places its bold copies.
@@ -6535,6 +7192,7 @@ namespace ChestItemFinder
             var ordered = items
                 .OrderBy(p => PlaceItemOrderOf(p.Key).Term)
                 .ThenBy(p => PlaceItemOrderOf(p.Key).Position)
+                .ThenBy(p => IsNestedRow(p.Key))       // the item lying there directly first, then the same item inside a carried container
                 .ThenBy(p => QualityRowOrder(p.Key))   // one row per quality: plain, silver, gold, iridium
                 .ThenByDescending(p => p.Value)
                 .ThenBy(p => p.Key, StringComparer.CurrentCultureIgnoreCase)
@@ -6543,30 +7201,35 @@ namespace ChestItemFinder
             int availableHeight = (above ? topY : screenHeight - topY) - 16 - padY * 2 - headerHeight;
             int maxLines = Math.Max(3, availableHeight / lineHeight);
 
-            (string Text, Item? Icon) MakeLine(KeyValuePair<string, int> pair)
+            // an item inside a carried container: "Birch Dresser > " comes first, then the item's icon and name, so the icon stands next to the item it
+            // shows (see CONTAINERS INSIDE CONTAINERS). Prefix is "" for every other line.
+            (string Text, Item? Icon, Color? Mark, string Prefix) MakeLine(KeyValuePair<string, int> pair)
             {
                 string countText = $" {times}{pair.Value}";
-                int nameRoom = maxLineWidth - iconSlot - (int)Math.Ceiling(Game1.smallFont.MeasureString(countText).X);
+                string prefix = RowPrefix(pair.Key, Game1.smallFont);
+                int prefixWidth = prefix.Length > 0 ? (int)Math.Ceiling(Game1.smallFont.MeasureString(prefix).X) : 0;
+                int nameRoom = maxLineWidth - prefixWidth - iconSlot - (int)Math.Ceiling(Game1.smallFont.MeasureString(countText).X);
                 Item? icon = null;
                 if (samples != null)
                     samples.TryGetValue(pair.Key, out icon);
-                return (FitText(RowName(pair.Key), nameRoom, Game1.smallFont) + countText, icon);   // a quality row shows just the item name (its star is on the icon)
+                // several words: a mark in the flash color of the first word that found the item (see SEVERAL WORDS, SEVERAL COLORS)
+                return (FitText(RowName(pair.Key), nameRoom, Game1.smallFont) + countText, icon, ItemLineMark(pair.Key), prefix);   // a quality row shows just the item name (its star is on the icon)
             }
 
-            var lines = new List<(string Text, Item? Icon)>();
+            var lines = new List<(string Text, Item? Icon, Color? Mark, string Prefix)>();
             var headings = new HashSet<int>();   // indexes of the lines that are section headings
             if (sections != null && sections.Count > 1)
             {
                 // per section: its heading, then its items (most numerous first); if everything does not fit, the rest is "+N more" (items only)
-                var all = new List<(string Text, Item? Icon, bool Heading)>();
+                var all = new List<(string Text, Item? Icon, Color? Mark, string Prefix, bool Heading)>();
                 foreach (var (sectionTitle, sectionItems) in sections)
                 {
-                    all.Add((sectionTitle, null, true));
+                    all.Add((sectionTitle, null, null, "", true));
                     foreach (var pair in sectionItems.OrderBy(p => PlaceItemOrderOf(p.Key).Term).ThenBy(p => PlaceItemOrderOf(p.Key).Position)
-                                 .ThenBy(p => QualityRowOrder(p.Key)).ThenByDescending(p => p.Value).ThenBy(p => p.Key, StringComparer.CurrentCultureIgnoreCase))
+                                 .ThenBy(p => IsNestedRow(p.Key)).ThenBy(p => QualityRowOrder(p.Key)).ThenByDescending(p => p.Value).ThenBy(p => p.Key, StringComparer.CurrentCultureIgnoreCase))
                     {
                         var line = MakeLine(pair);
-                        all.Add((line.Text, line.Icon, false));
+                        all.Add((line.Text, line.Icon, line.Mark, line.Prefix, false));
                     }
                 }
 
@@ -6575,10 +7238,10 @@ namespace ChestItemFinder
                 {
                     if (all[i].Heading)
                         headings.Add(lines.Count);
-                    lines.Add((all[i].Text, all[i].Icon));
+                    lines.Add((all[i].Text, all[i].Icon, all[i].Mark, all[i].Prefix));
                 }
                 if (shown < all.Count)
-                    lines.Add(($"+{all.Skip(shown).Count(l => !l.Heading)} more", null));
+                    lines.Add(($"+{all.Skip(shown).Count(l => !l.Heading)} more", null, null, ""));
             }
             else if (ordered.Count <= maxLines)
             {
@@ -6587,12 +7250,13 @@ namespace ChestItemFinder
             else
             {
                 lines.AddRange(ordered.Take(maxLines - 1).Select(MakeLine));
-                lines.Add(($"+{ordered.Count - (maxLines - 1)} more", null));
+                lines.Add(($"+{ordered.Count - (maxLines - 1)} more", null, null, ""));
             }
 
             // the header row must fit the title AND the total; the item lines (icon slot + text) may be wider still
             int headerRowWidth = (int)Math.Ceiling(titleSize.X);
-            int textWidth = Math.Max(headerRowWidth, (int)lines.Max(l => Game1.smallFont.MeasureString(l.Text).X) + iconSlot);
+            int PrefixWidth(string prefix) => prefix.Length > 0 ? (int)Math.Ceiling(Game1.smallFont.MeasureString(prefix).X) : 0;
+            int textWidth = Math.Max(headerRowWidth, (int)lines.Max(l => PrefixWidth(l.Prefix) + Game1.smallFont.MeasureString(l.Text).X) + iconSlot);
             int boxWidth = textWidth + padX * 2;
             int boxHeight = padY * 2 + headerHeight + lines.Count * lineHeight;
 
@@ -6633,17 +7297,32 @@ namespace ChestItemFinder
                     continue;
                 }
 
+                // an item inside a carried container: "Birch Dresser > " first, the item's icon and name after it
+                int itemX = lineX;
+                if (line.Prefix.Length > 0)
+                {
+                    Utility.drawTextWithShadow(b, line.Prefix, Game1.smallFont, new Vector2(lineX, CenteredTextY(Game1.smallFont, lineY, lineHeight)), Game1.textColor);
+                    itemX += PrefixWidth(line.Prefix);
+                }
+
                 if (line.Icon != null)
                 {
                     int iconY = lineY + (lineHeight - iconSize) / 2;
-                    DrawItemIcon(b, line.Icon, lineX, iconY, iconSize);
+                    DrawItemIcon(b, line.Icon, itemX, iconY, iconSize);
 
                     // one row per quality: the star in the icon's lower left corner, like the game's inventory (only these samples keep a star)
                     if (SearchMenu.HasStarSprite(line.Icon.Quality))
-                        SearchMenu.DrawQualityStar(b, new Vector2(lineX - 2, iconY + iconSize - 8 * IconStarScale + 2), line.Icon.Quality, IconStarScale);
+                        SearchMenu.DrawQualityStar(b, new Vector2(itemX - 2, iconY + iconSize - 8 * IconStarScale + 2), line.Icon.Quality, IconStarScale);
                 }
 
-                Utility.drawTextWithShadow(b, line.Text, Game1.smallFont, new Vector2(lineX + iconSlot, CenteredTextY(Game1.smallFont, lineY, lineHeight)), Game1.textColor);
+                var textAt = new Vector2(itemX + iconSlot, CenteredTextY(Game1.smallFont, lineY, lineHeight));
+                if (line.Mark is Color mark)
+                {
+                    // the highlighter mark behind the item line, in the flash color of its word (the text keeps its normal color)
+                    Vector2 textSize = Game1.smallFont.MeasureString(line.Text);
+                    b.Draw(Game1.staminaRect, new Rectangle((int)textAt.X - 4, (int)(textAt.Y + textSize.Y * 0.1f), (int)Math.Ceiling(textSize.X) + 8, (int)(textSize.Y * 0.8f)), mark);
+                }
+                Utility.drawTextWithShadow(b, line.Text, Game1.smallFont, textAt, Game1.textColor);
                 lineY += lineHeight;
             }
         }
@@ -6679,7 +7358,7 @@ namespace ChestItemFinder
         private const string KeepBoxNothingTip = "Nothing left to keep.";   // unchecked, and the highlights are already gone (expired, or the found chest was opened)
 
         /// <summary>Unchecked and nothing is highlighted any more: checking the box would keep nothing, so it does not react (see KeepBoxNothingTip).</summary>
-        private bool KeepBoxHasNothingToKeep => !keepBoxDismissed && !IsKeepHighlightsLocked && highlightedChests.Count == 0;
+        private bool KeepBoxHasNothingToKeep => !keepBoxDismissed && !IsKeepHighlightsLocked && !AnyHighlight;
 
         // the game's own checkbox sprites (the ones its options menu uses), in Game1.mouseCursors
         private static readonly Rectangle CheckboxEmptySource = new(227, 425, 9, 9);
@@ -6733,11 +7412,13 @@ namespace ChestItemFinder
             if (fadeOut)
             {
                 keepSavedChests = new List<(GameLocation location, Vector2 position, Chest chest)>(highlightedChests);
+                keepSavedBackpack = highlightBackpack;
                 keepFadeUntilMs = clock.ElapsedMilliseconds + KeepBoxFadeMs;
             }
             else
             {
                 keepSavedChests = null;
+                keepSavedBackpack = false;
                 keepFadeUntilMs = 0;
             }
 
@@ -6749,6 +7430,7 @@ namespace ChestItemFinder
         {
             keepFadeUntilMs = 0;
             keepSavedChests = null;
+            keepSavedBackpack = false;
         }
 
         // Brings a fading box back: locked again, and the chests that were highlighted at the moment of unchecking light up again.
@@ -6757,6 +7439,8 @@ namespace ChestItemFinder
             highlightedChests = keepSavedChests != null
                 ? new List<(GameLocation location, Vector2 position, Chest chest)>(keepSavedChests)
                 : new List<(GameLocation location, Vector2 position, Chest chest)>();
+            highlightBackpack = keepSavedBackpack;
+            keepSavedBackpack = false;
             keepSavedChests = null;
             keepFadeUntilMs = 0;
             keepBoxDismissed = false;
@@ -6934,7 +7618,7 @@ namespace ChestItemFinder
             else
             {
                 // nothing left to keep (e.g. the found chest was already opened): the box stays unchecked, the click is not used
-                if (highlightedChests.Count == 0)
+                if (!AnyHighlight)
                     return;
 
                 IsKeepHighlightsLocked = true;
@@ -7106,7 +7790,7 @@ namespace ChestItemFinder
 
             // a failed search: the warning badge sits at the left end of the title row, so the title starts a little further right
             bool showFailIcon = resultFailed;
-            bool showBackpackIcon = resultBackpackIcon && !resultFailed;   // found in the backpack: a backpack instead of the warning sign
+            bool showBackpackIcon = resultBackpackIcon && !resultFailed;   // found only in the backpack: a backpack instead of the warning sign
             int leftReserve = showFailIcon || showBackpackIcon ? WarningBadgeSize + WarningBadgeGap - (padX - WarningBadgeLeftInset) : 0;
 
             string title = WrapTitle((int)((maxTextWidth - iconReserve - leftReserve) / titleScale));
@@ -7118,26 +7802,26 @@ namespace ChestItemFinder
             // a failed search with spelling suggestions: one more row under the title, "Did you mean: Starfruit, Strawberry"
             List<(string Label, string Query, int Width, string? Tip)> suggestionChips = LayoutSuggestionChips(suggestionMaxWidth, out int suggestionRowWidth);
 
-            // the button of a failed search ("Check Backpack"), at the bottom of the panel
-            List<(ResultAction Action, string Label, int Width)> actionButtons = GetResultActionButtons();
-            int actionRowWidth = actionButtons.Count == 0 ? 0 : actionButtons.Sum(a => a.Width) + ResultActionGap * (actionButtons.Count - 1);
-
             // the last line, when the search left words out (see AT MOST THREE AT A TIME): grey, part of the panel, so it never covers anything
             string limitNote = lastIgnoredTerms.Count > 0
                 ? Game1.parseText($"Only {MaxSearchTerms} at a time: {string.Join(", ", lastIgnoredTerms.Select(t => "\"" + t + "\""))} "
                     + (lastIgnoredTerms.Count == 1 ? "was" : "were") + " not searched.", Game1.smallFont, maxTextWidth)
                 : "";
+            // the items of the last death Marlon can sell back (see LOST WHEN THE PLAYER DIED): one more grey line, in the same spot
+            if (lostOnDeathNote.Length > 0)
+            {
+                string deathNote = Game1.parseText(lostOnDeathNote, Game1.smallFont, maxTextWidth);
+                limitNote = limitNote.Length > 0 ? limitNote + "\n" + deathNote : deathNote;
+            }
             Vector2 limitNoteSize = limitNote.Length > 0 ? Game1.smallFont.MeasureString(limitNote) : Vector2.Zero;
 
-            int textWidth = (int)Math.Max(Math.Max(Math.Max(Math.Max(titleSize.X + iconReserve + leftReserve, bodySize.X), suggestionRowWidth), actionRowWidth), limitNoteSize.X);
+            int textWidth = (int)Math.Max(Math.Max(Math.Max(titleSize.X + iconReserve + leftReserve, bodySize.X), suggestionRowWidth), limitNoteSize.X);
             int boxWidth = textWidth + padX * 2;
             int boxHeight = (int)titleSize.Y + padY * 2;
             if (body.Length > 0)
                 boxHeight += gap * 2 + 2 + (int)bodySize.Y;
             int suggestionBlockHeight = suggestionChips.Count > 0 ? gap * 2 + 2 + Game1.smallFont.LineSpacing : 0;   // divider + row; a found search has this above its place list
             boxHeight += suggestionBlockHeight;
-            int actionBlockHeight = actionButtons.Count > 0 ? gap + ResultActionHeight + 4 : 0;   // a little air, then the buttons (they have their own frame, no divider)
-            boxHeight += actionBlockHeight;
             int limitNoteHeight = limitNote.Length > 0 ? gap + (int)limitNoteSize.Y : 0;           // the "Only 3 at a time" line, the very last one
             boxHeight += limitNoteHeight;
 
@@ -7236,7 +7920,7 @@ namespace ChestItemFinder
                 // is exactly what it was when the mouse arrived, and it runs on from there when the mouse leaves. (Locked highlights never
                 // expire, so there is nothing to freeze then; "never expire" (-1) stays as it is.)
                 highlightHoverFrameMs = now;
-                if (!IsKeepHighlightsLocked && highlightedChests.Count > 0 && highlightUntilMs >= 0)
+                if (!IsKeepHighlightsLocked && AnyHighlight && highlightUntilMs >= 0)
                     highlightUntilMs += frameDelta;
             }
 
@@ -7253,6 +7937,7 @@ namespace ChestItemFinder
                 // the whole title in the normal text color (its "(Invalid: ...)" part, if it has one, in dark red), then the emphasized parts (the quoted
                 // item names of "Found ... containing 'name'", or the searched words of "No item 'name' found") drawn bold on top of it in the very same color
                 Vector2 titlePos = new Vector2(textPos.X + leftReserve, textPos.Y);
+                DrawTitleMarks(b, title, titlePos, titleScale, alpha);   // several words: the highlighter marks behind the words
                 DrawTitleText(b, title, titlePos, titleScale, Game1.textColor * alpha, InvalidTitleColor * alpha);
                 DrawTitleEmphasis(b, title, titlePos, titleScale, Game1.textColor * alpha, InvalidTitleColor * alpha);
 
@@ -7302,7 +7987,7 @@ namespace ChestItemFinder
                         alpha);
                 }
 
-                // found in the backpack ("Check Backpack"): a small backpack in the same slot, display only
+                // found only in the backpack ("Found your backpack containing ..."): a small backpack in the same slot, display only
                 if (showBackpackIcon)
                 {
                     float firstLineHeight = Game1.dialogueFont.LineSpacing * titleScale;
@@ -7318,25 +8003,6 @@ namespace ChestItemFinder
                 {
                     var notePos = new Vector2(boxX + padX, boxY + boxHeight - padY - limitNoteSize.Y + 4);
                     Utility.drawTextWithShadow(b, limitNote, Game1.smallFont, notePos, Game1.textColor * 0.6f * alpha);
-                }
-
-                // the buttons of a failed search: bottom of the panel, from the left, the game's own button frame (brighter while hovered)
-                resultActionHitBoxes.Clear();
-                if (actionButtons.Count > 0)
-                {
-                    int buttonY = boxY + boxHeight - padY - limitNoteHeight - ResultActionHeight + 4;
-                    int buttonX = boxX + padX;
-                    foreach (var (action, label, width) in actionButtons)
-                    {
-                        var bounds = new Rectangle(buttonX, buttonY, width, ResultActionHeight);
-                        bool hovered = overPanel && bounds.Contains(mouse);
-                        DrawResultActionButton(b, bounds, label, hovered, alpha);
-                        resultActionHitBoxes.Add((bounds, action));
-                        if (hovered)
-                            pendingTitleTip = "Look for it in your backpack";
-                        buttonX += width + ResultActionGap;
-                    }
-                    resultActionsDrawnMs = now;
                 }
 
                 // the "Did you mean" row: a divider like the one above the place list, then the label and the clickable words (underlined, blue; brighter
@@ -7522,6 +8188,7 @@ namespace ChestItemFinder
         }
 
         // ===================== HOVER TIP OF A HIGHLIGHTED CHEST (in the world) =====================
+        // (The flashing player, the backpack, has the same tip: see the end of this method's search for a hovered container.)
         // While the mouse is over a chest that is highlighted right now, the same item list as a hovered place word pops up (DrawPlaceTooltip), but only
         // for THIS chest: "Chest total: 3", then one line per matching item with its real icon and count. It is display only (no click, no pick-up).
         // The list is worked out live from the chest with the matcher of the last search, so it is always what the chest holds at this moment; a chest
@@ -7534,10 +8201,13 @@ namespace ChestItemFinder
             try
             {
                 Func<Item, bool>? matcher = highlightMatcher;
-                if (highlightedChests.Count == 0 || matcher == null)
+                if ((highlightedChests.Count == 0 && !highlightBackpack) || matcher == null)
                     return;
-                if (Config.HighlightOpacityPercent <= 0)
-                    return;   // the highlight is not drawn at 0%, so there is nothing to hover
+                // chests: the highlight is not drawn at 0%, so there is nothing to hover. The player (the backpack) is different: its tip stays as long
+                // as the backpack is highlighted, also when its flash is switched off in the config.
+                bool chestTipsOn = highlightedChests.Count > 0 && Config.HighlightOpacityPercent > 0;
+                if (!chestTipsOn && !highlightBackpack)
+                    return;
                 if (!Context.IsWorldReady || Game1.activeClickableMenu != null || Game1.eventUp || Game1.currentLocation == null)
                     return;
 
@@ -7557,6 +8227,9 @@ namespace ChestItemFinder
                 var mouseTile = new Point(tileX, tileY);
                 foreach (var (location, position, chest) in highlightedChests)
                 {
+                    if (!chestTipsOn)
+                        break;
+
                     // any tile of the container counts: both halves of a fridge, every tile of a building or a dresser
                     if (location == Game1.currentLocation && FootprintOf(chest, position).Contains(mouseTile))
                     {
@@ -7567,17 +8240,46 @@ namespace ChestItemFinder
                 }
 
                 if (hoveredChest == null)
+                {
+                    // the flashing player (the backpack): the same list as for a chest, from the backpack's items right now
+                    Farmer? farmer = Game1.player;
+                    if (!highlightBackpack || farmer == null)
+                        return;
+                    var playerBox = new Rectangle((int)farmer.Position.X - 8, (int)farmer.Position.Y - 104, 80, 160);   // the same box that flashes
+                    if (!playerBox.Contains(worldMouse.X + Game1.viewport.X, worldMouse.Y + Game1.viewport.Y))
+                        return;
+
+                    var backpackTotals = new Dictionary<string, int>();
+                    var backpackSamples = new Dictionary<string, Item>();
+                    foreach (var (item, inside, _) in WithNested(GetBackpackItems()))
+                    {
+                        if (!matcher(item))
+                            continue;
+
+                        string name = RowKey(item, inside);
+                        backpackTotals[name] = backpackTotals.GetValueOrDefault(name) + item.Stack;
+                        if (!chestTipSamples.TryGetValue(name, out Item? sample))
+                            chestTipSamples[name] = sample = MakeIconSample(item, singleItemQualityRows);
+                        backpackSamples[name] = sample;
+                    }
+
+                    if (backpackTotals.Count == 0)
+                        return;   // the backpack holds nothing of the search any more: no tip
+
+                    bool aboveBackpack = uiMouse.Y > Game1.uiViewport.Height * 0.6f;
+                    DrawPlaceTooltip(e.SpriteBatch, BackpackPlaceKey, backpackTotals, backpackSamples, uiMouse.X + 32 + 28, aboveBackpack ? uiMouse.Y - 16 : uiMouse.Y + 32, null, aboveBackpack);
                     return;
+                }
 
                 // what THIS container holds of the search: item name -> total stack (all qualities added up), like the place list
                 var totals = new Dictionary<string, int>();
                 var samples = new Dictionary<string, Item>();
-                foreach (Item item in CurrentItems(hoveredChest))
+                foreach (var (item, inside, _) in WithNested(CurrentItems(hoveredChest)))
                 {
                     if (!matcher(item))
                         continue;
 
-                    string name = RowKey(item);   // the item name, or name + quality (see ONE ROW PER QUALITY)
+                    string name = RowKey(item, inside);   // the item name, or name + quality (see ONE ROW PER QUALITY); inside a carried container marked so
                     totals[name] = totals.GetValueOrDefault(name) + item.Stack;
                     if (!chestTipSamples.TryGetValue(name, out Item? sample))
                         chestTipSamples[name] = sample = MakeIconSample(item, singleItemQualityRows);
@@ -7609,7 +8311,7 @@ namespace ChestItemFinder
 
         private void OnRenderedWorld(object? sender, RenderedWorldEventArgs e)
         {
-            if (highlightedChests.Count == 0) return;
+            if (!AnyHighlight) return;
             if (Config.HighlightOpacityPercent <= 0) return;   // 0% = do not draw the highlight at all
 
             // the flash pulses between 40% and 100% of the chosen opacity
@@ -7631,7 +8333,8 @@ namespace ChestItemFinder
             }
             float pulse = (float)(Math.Sin(phase) + 1) / 2f;
             float alpha = peak * (0.4f + pulse * 0.6f);
-            Color baseColor = HighlightColors.TryGetValue(Config.HighlightColor ?? "", out Color chosen) ? chosen : Color.Yellow;
+            Color baseColor = WordFlashColor(0);   // the main color
+            bool perWord = highlightWordCount > 0;
 
             foreach (var (location, position, chest) in highlightedChests)
             {
@@ -7640,12 +8343,42 @@ namespace ChestItemFinder
                 // the flash covers the container's whole footprint: one tile for a chest, both halves of a fridge, every tile of a building / dresser
                 Rectangle area = FootprintPixels(chest, position);
                 Vector2 screenPos = Game1.GlobalToLocal(Game1.viewport, new Vector2(area.X, area.Y));
+                var flash = new Rectangle((int)screenPos.X - 4, (int)screenPos.Y - 4, area.Width + 8, area.Height + 8);
 
-                e.SpriteBatch.Draw(
-                    Game1.fadeToBlackRect,
-                    new Rectangle((int)screenPos.X - 4, (int)screenPos.Y - 4, area.Width + 8, area.Height + 8),
-                    baseColor * alpha
-                );
+                // several words: one upright strip per word the chest holds, left to right in the order typed (see SEVERAL WORDS, SEVERAL COLORS)
+                if (perWord && chestWordSlots.TryGetValue(chest, out int[]? slots) && slots.Length > 0)
+                {
+                    for (int k = 0; k < slots.Length; k++)
+                    {
+                        int left = flash.X + flash.Width * k / slots.Length;
+                        int right = flash.X + flash.Width * (k + 1) / slots.Length;
+                        e.SpriteBatch.Draw(Game1.fadeToBlackRect, new Rectangle(left, flash.Y, right - left, flash.Height), WordFlashColor(slots[k]) * alpha);
+                    }
+                    continue;
+                }
+
+                e.SpriteBatch.Draw(Game1.fadeToBlackRect, flash, baseColor * alpha);
+            }
+
+            // the backpack: the player flashes like a chest (head to feet), in strips when several words are searched
+            if (highlightBackpack && Config.FlashPlayer && Game1.player != null)
+            {
+                Vector2 playerTopLeft = Game1.GlobalToLocal(Game1.viewport, Game1.player.Position + new Vector2(-8f, -104f));
+                var playerFlash = new Rectangle((int)playerTopLeft.X, (int)playerTopLeft.Y, 80, 160);
+
+                if (perWord && backpackWordSlots.Length > 0)
+                {
+                    for (int k = 0; k < backpackWordSlots.Length; k++)
+                    {
+                        int left = playerFlash.X + playerFlash.Width * k / backpackWordSlots.Length;
+                        int right = playerFlash.X + playerFlash.Width * (k + 1) / backpackWordSlots.Length;
+                        e.SpriteBatch.Draw(Game1.fadeToBlackRect, new Rectangle(left, playerFlash.Y, right - left, playerFlash.Height), WordFlashColor(backpackWordSlots[k]) * alpha);
+                    }
+                }
+                else
+                {
+                    e.SpriteBatch.Draw(Game1.fadeToBlackRect, playerFlash, baseColor * alpha);
+                }
             }
         }
     }

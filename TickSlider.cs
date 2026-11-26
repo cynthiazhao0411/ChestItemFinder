@@ -53,6 +53,16 @@ namespace ChestItemFinder
         private bool dragging;
         private bool wasMouseDown;
 
+        /// <summary>Room for the note under the slider (see <see cref="Note"/>).</summary>
+        private const int NoteHeight = 30;
+        private static readonly Color NoteColor = new(200, 30, 30);
+
+        /// <summary>A note under the slider for the value set on the page right now ("0%: nothing flashes ..."), or null for none.</summary>
+        public Func<int, string?>? Note { get; set; }
+
+        /// <summary>Height of the option: the slider, and the room for the note while there is one.</summary>
+        public int Height => RowHeight + (Note?.Invoke(value) != null ? NoteHeight : 0);
+
         public TickSlider(Func<int> readConfig, Action<int> writeConfig, int min, int max, int step)
         {
             this.readConfig = readConfig;
@@ -137,6 +147,11 @@ namespace ChestItemFinder
             // knob (drawn last, on top of the notches)
             float t = (value - min) / (float)(max - min);
             b.Draw(Game1.mouseCursors, new Vector2(x0 + knobTravel * t, trackY), KnobSource, Color.White, 0f, Vector2.Zero, 4f, SpriteEffects.None, 0.9f);
+
+            // the note under the slider, for the value as it is set now (it follows the knob while dragging)
+            string? note = Note?.Invoke(value);
+            if (note != null)
+                b.DrawString(Game1.smallFont, note, new Vector2(x0, position.Y + RowHeight), NoteColor);
         }
 
         /// <summary>Handle clicking and dragging. GMCM does not forward mouse input to custom options, so poll it here.</summary>
